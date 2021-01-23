@@ -98,11 +98,11 @@ void triton_dot(drv::context* context,  drv::stream* stream, bool AT, bool BT,
   // macros
   rt::options_space_t opts;
   // A access patterns
-  opts.defines.push_back({"STRIDE_AK",    {AT? sa[a_order[0]] : sa[a_order[1]] }});
-  opts.defines.push_back({"STRIDE_AM",    {AT? sa[a_order[1]] : sa[a_order[0]] }});
+  opts.defines.push_back({"STRIDE_AK", {AT? sa[a_order[0]] : sa[a_order[1]] }});
+  opts.defines.push_back({"STRIDE_AM", {AT? sa[a_order[1]] : sa[a_order[0]] }});
   // B access patterns
-  opts.defines.push_back({"STRIDE_BK",    {BT? sb[b_order[1]] : sb[b_order[0]] }});
-  opts.defines.push_back({"STRIDE_BN",    {BT? sb[b_order[0]] : sb[b_order[1]] }});
+  opts.defines.push_back({"STRIDE_BK", {BT? sb[b_order[1]] : sb[b_order[0]] }});
+  opts.defines.push_back({"STRIDE_BN", {BT? sb[b_order[0]] : sb[b_order[1]] }});
   // data-type
   opts.defines.push_back({"TYPE", {ty}});
   // tile sizes

@@ -13,15 +13,19 @@
 #include "triton/ir/function.h"
 
 using namespace triton;
-
 namespace rt = triton::runtime;
+namespace drv = triton::driver;
 
 typedef std::pair<int, int> map_key_t;
-std::map<map_key_t, std::shared_ptr<rt::function::grid_fn_ty>> id_grid_map;
-std::map<map_key_t, std::shared_ptr<rt::function>> id_fn_map;
 
-CUstream torch_get_cuda_stream(int64_t dev_id);
-CUdevice torch_get_cuda_device(int64_t dev_id);
+std::map<map_key_t, std::shared_ptr<rt::function::grid_fn_ty>> id_grid_map;
+std::map<int, std::shared_ptr<rt::function>> id_fn_map;
+std::map<int, std::shared_ptr<triton::driver::device>> tt_devices;
+std::map<int, std::shared_ptr<triton::driver::stream>> tt_streams;
+std::unordered_map<rt::kernel*, pybind11::object> opt_cache_;
+extern CUstream torch_get_cuda_stream(int64_t dev_id);
+extern CUdevice torch_get_cuda_device(int64_t dev_id);
+
 
 /* Grid utilities */
 
@@ -36,69 +40,71 @@ void delete_grid(const map_key_t& key) {
 
 /* Function utilities */
 
-void register_fn(const map_key_t& key,
+void register_fn(int op_id, 
+                 int dev_id,
                  const std::string& src,
                  const rt::options_space_t& opt) {
-  if(id_fn_map.find(key) == id_fn_map.end())
-    id_fn_map[key].reset(new rt::function(src, opt, ""));
+  if(tt_devices.find(dev_id) == tt_devices.end()) {
+    driver::device* device;
+    driver::stream* stream;
+    if(dev_id >= 0){
+      device = new triton::driver::cu_device(torch_get_cuda_device(dev_id), false);
+      stream = new triton::driver::cu_stream(torch_get_cuda_stream(dev_id), false);
+    }
+    else{
+      device = new triton::driver::host_device();
+      stream = new triton::driver::host_stream();
+    }
+    tt_devices[dev_id].reset(device);
+    tt_streams[dev_id].reset(stream);
+  }
+  if(id_fn_map.find(op_id) == id_fn_map.end()){
+    id_fn_map[op_id].reset(new rt::function(src, opt, &*tt_devices[dev_id]));
+  }
 }
 
-void delete_fn(const map_key_t& key) {
-  id_fn_map.erase(key);
+void delete_fn(int op_id) {
+  id_fn_map.erase(op_id);
 }
 
-std::string get_fn_asm(const map_key_t& key, rt::asm_mode_t mode, const rt::options_t& opt) {
-  triton::driver::cu_device device(key.second, false);
-  return id_fn_map[key]->get_asm(mode, &device, opt);
-}
 
 void cleanup() {
   id_grid_map.clear();
   id_fn_map.clear();
+  opt_cache_.clear();
 }
 
 size_t make_op_id() {
   return id_fn_map.size();
 }
 
-/* Function signature */
-void make_module(const std::string& src, ir::module* ir,
-                 const runtime::options_space_t& opt) {
-  std::string copy = triton::runtime::function::preheader() + src;
-  // pre-process
-  TokenSequence tokens;
-  Preprocessor cpp(&copy, true);
-  for(auto it: opt.defines){
-    cpp.AddMacro(it.first, &it.second[0]);
-  }
-  cpp.Process(tokens);
-  // parse
-  Parser parser(tokens);
-  parser.Parse();
-  Generator gen(&parser);
-  gen.Gen(ir);
+std::vector<rt::arg_type> get_fn_signature(size_t op_id) {
+  return id_fn_map[op_id]->get_kernels()[0].second->get_sig();
 }
 
-std::vector<rt::arg_type> get_fn_signature(const std::string& src,
-                                           const runtime::options_space_t& opt) {
-  // triton-ir code-gen
-  ir::context ctx;
-  auto ir = std::shared_ptr<ir::module>(new ir::module("", ctx));
-  make_module(src, &*ir, opt);
-  // function
-  ir::function* fn = ir->get_function_list().front();
-  // extract signature
-  std::vector<rt::arg_type> ret;
-  ir::function_type* ty = fn->get_fn_type();
-  for(size_t i = 0; i < ty->get_num_params(); i++)
-    ret.push_back(rt::convert(ty->get_param_ty(i)));
-  return ret;
+void launch_kernel(int64_t op_id, int64_t dev_id, const std::string& args, size_t grid_0, size_t grid_1, size_t grid_2){
+  rt::function* fn = id_fn_map.at(op_id).get();
+  (*fn)((void**)args.c_str(), args.size(), {grid_0, grid_1, grid_2}, &*tt_streams[dev_id]);
+}
+
+pybind11::object autotune(int64_t op_id, int64_t dev_id, const std::string& args, const rt::function::grid_fn_ty& grid){
+  rt::function* fn = id_fn_map.at(op_id).get();
+  rt::kernel* kernel = fn->autotune((void**)args.c_str(), args.size(), grid, &*tt_streams[dev_id]);
+  auto it = opt_cache_.find(kernel);
+  if(it == opt_cache_.end()){
+    pybind11::object obj = pybind11::cast(&kernel->opt, pybind11::return_value_policy::reference);
+    obj.attr("TM") = pybind11::cast(kernel->opt.D<int>("TM"));
+    obj.attr("TN") = pybind11::cast(kernel->opt.D<int>("TN"));
+    it = opt_cache_.insert({kernel, obj}).first;
+  }
+  return it->second;
 }
 
 typedef triton::runtime::options_t options_t;
 typedef triton::runtime::options_space_t options_space_t;
 
 void init_superblocking(pybind11::module &m);
+void init_launch(pybind11::module &m);
 
 PYBIND11_MODULE(libtriton, m) {
     m.doc() = "Python bindings to the C++ Triton API";
@@ -119,9 +125,8 @@ PYBIND11_MODULE(libtriton, m) {
         .value("ptx", rt::ASM_NV_PTX)
         .value("sass", rt::ASM_NV_SASS);
 
-    pybind11::class_<options_t>(m, "options")
+    pybind11::class_<options_t>(m, "options", pybind11::dynamic_attr())
         .def(pybind11::init<>())
-        .def("d", &options_t::D<int>)
         .def_readwrite("num_warps", &options_t::num_warps)
         .def_readwrite("defines"  , &options_t::defines);
 
@@ -132,13 +137,16 @@ PYBIND11_MODULE(libtriton, m) {
 
     // hooks into triton constructs since frameworks may not use pybind11
     m.def("get_fn_signature", &get_fn_signature);
-    m.def("get_fn_asm", &get_fn_asm);
+    // m.def("get_fn_asm", &get_fn_asm);
     m.def("register_grid", &register_grid);
     m.def("delete_grid", &delete_grid);
     m.def("register_fn", &register_fn);
     m.def("delete_fn", &delete_fn);
     m.def("make_op_id", &make_op_id);
     m.def("cleanup", &cleanup);
+    m.def("autotune", &autotune, pybind11::return_value_policy::reference);
+    m.def("launch_kernel", &launch_kernel);
 
+    init_launch(m);
     init_superblocking(m);
 }

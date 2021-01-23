@@ -1,5 +1,6 @@
 import torch
 import triton
+import struct
 
 class _matmul(torch.autograd.Function):
     src = """
@@ -10,12 +11,12 @@ __global__ void matmul(TYPE * A __noalias __readonly __aligned(16),
                        TYPE * B __noalias __readonly __aligned(16),
                        TYPE * C __noalias __aligned(16),
                        float alpha,
-                       int M __retune,
-                       int N __retune,
-                       int K __retune __multipleof(16),
-                       int stride_am __multipleof(M_STRIDE_AM), int stride_ak __multipleof(M_STRIDE_AK),
-                       int stride_bk __multipleof(M_STRIDE_BK), int stride_bn __multipleof(M_STRIDE_BN),
-                       int stride_cm __multipleof(M_STRIDE_CM), int stride_cn __multipleof(M_STRIDE_CN),
+                       int M,
+                       int N,
+                       int K __multipleof(16),
+                       int lda __multipleof(LDA_POW2_DIV),
+                       int ldb __multipleof(LDB_POW2_DIV),
+                       int ldc __multipleof(LDC_POW2_DIV),
                        int* locks) {
       // prologue
       int pid = get_program_id(0);
@@ -81,7 +82,7 @@ __global__ void matmul(TYPE * A __noalias __readonly __aligned(16),
       // epilogue
       int rcm[TM] = pidm * TM + 0 ... TM;
       int rcn[TN] = pidn * TN + 0 ... TN;
-      int offc[TM, TN] = rcm[:, newaxis] * stride_cm + rcn[newaxis, :];
+      int offc[TM, TN] = rcm[:, newaxis] * ldc + rcn[newaxis, :];
       TYPE* pc[TM, TN] = C + offc;
       bool checkc[TM, TN] = rcm[:, newaxis] < M && rcn[newaxis, :] < N;
 #if (TZ==1)
@@ -109,7 +110,7 @@ __global__ void matmul(TYPE * A __noalias __readonly __aligned(16),
     kernel = dict()
 
     @staticmethod
-    def multiple_of(N):
+    def largest_pow2_divisor(N):
         if N % 8 == 0: return 8
         if N % 4 == 0: return 4
         if N % 2 == 0: return 2
@@ -118,53 +119,55 @@ __global__ void matmul(TYPE * A __noalias __readonly __aligned(16),
         
     _locks = dict()
     @staticmethod
-    def get_locks(dev):
-        if dev not in _matmul._locks:
-            _matmul._locks[dev] = torch.zeros(1024*1024, dtype=torch.int32, device=dev)
-        return _matmul._locks[dev]
-
-    @staticmethod
     def _call(a, b):
+        dtype = a.dtype
+        device = a.device
         # allocate output
         M, K = a.shape
         K, N = b.shape
-        c = torch.empty((M, N), dtype=a.dtype, device=a.device)
+        c = torch.empty((M, N), dtype=dtype, device=device)
+        # handle non-contiguous inputs if necessary
+        if a.stride(0) > 1 and a.stride(1) > 1: a = a.contiguous()
+        if b.stride(0) > 1 and b.stride(1) > 1: b = b.contiguous()
         # kernel hash
-        m_stride_am = _matmul.multiple_of(a.stride(0))
-        m_stride_ak = _matmul.multiple_of(a.stride(1))
-        m_stride_bk = _matmul.multiple_of(b.stride(0))
-        m_stride_bn = _matmul.multiple_of(b.stride(1))
-        m_stride_cm = _matmul.multiple_of(c.stride(0))
-        m_stride_cn = _matmul.multiple_of(c.stride(1))
-        m_k_16      = K % 16 == 0
-        key = (c.device, c.dtype, a.stride(0) == 1, a.stride(1) == 1, b.stride(0) == 1, b.stride(1) == 1,
-               m_stride_am, m_stride_ak, m_stride_bk, m_stride_bn, m_stride_cm, m_stride_cn, m_k_16)
+        is_a_row = a.stride(1) == 1
+        is_b_row = b.stride(1) == 1
+        lda = a.stride(0) if is_a_row else a.stride(1)
+        ldb = b.stride(0) if is_b_row else b.stride(1)
+        ldc = c.stride(0)
+        lda_pow2_div = _matmul.largest_pow2_divisor(lda)
+        ldb_pow2_div = _matmul.largest_pow2_divisor(ldb)
+        ldc_pow2_div = _matmul.largest_pow2_divisor(ldc)
+        m_k_tk      = K % 32 == 0
+        key = (device, dtype, is_a_row, is_b_row, lda_pow2_div, ldb_pow2_div, ldc_pow2_div, m_k_tk)
         if key not in _matmul.kernel:
             defines = {
-                'TYPE' : c.dtype,
-                'SHAPE_A': 'TM, TK', 'SHAPE_B': 'TK, TN',
-                'STRIDE_AM': '1' if a.stride(0) == 1 else 'stride_am', 
-                'STRIDE_AK': '1' if a.stride(1) == 1 else 'stride_ak',
-                'STRIDE_BK': '1' if b.stride(0) == 1 else 'stride_bk',
-                'STRIDE_BN': '1' if b.stride(1) == 1 else 'stride_bn',
-                'M_STRIDE_AM': m_stride_am,
-                'M_STRIDE_AK': m_stride_ak,
-                'M_STRIDE_BK': m_stride_bk,
-                'M_STRIDE_BN': m_stride_bn,
-                'M_STRIDE_CM': m_stride_cm,
-                'M_STRIDE_CN': m_stride_cn,
-                'TM'   : _matmul.TM,
-                'TN'   : _matmul.TN,
-                'TK'   : _matmul.TK,
-                'TZ'   : _matmul.TZ
+                'TYPE' : dtype,
+                'STRIDE_AM'   : 'lda' if is_a_row else '1', 
+                'STRIDE_AK'   : '1'   if is_a_row else 'lda',
+                'STRIDE_BK'   : 'ldb' if is_b_row else '1',
+                'STRIDE_BN'   : '1'   if is_b_row else 'ldb',
+                'LDA_POW2_DIV': lda_pow2_div,
+                'LDB_POW2_DIV': ldb_pow2_div,
+                'LDC_POW2_DIV': ldc_pow2_div,
+                'TM'          : _matmul.TM,
+                'TN'          : _matmul.TN,
+                'TK'          : _matmul.TK,
+                'TZ'          : _matmul.TZ
             }
-            if m_k_16:
+            if m_k_tk:
                 defines['K_MULTIPLE_OF_TK'] = '1'
-            _matmul.kernel[key] = triton.kernel(_matmul.src, c.device, num_warps=_matmul.num_warps, defines=defines)
+            _matmul.kernel[key] = triton.kernel(_matmul.src, device, num_warps=_matmul.num_warps, defines=defines)
         kernel = _matmul.kernel[key]
+        # # locks for split-k
+        if device not in _matmul._locks:
+          _matmul._locks[device] = torch.zeros(1024*1024, dtype=torch.int32, device=device)
+        locks = _matmul._locks[device]
         # enqueue
-        kernel(a, b, c, 1., M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1), _matmul.get_locks(c.device), 
-               grid = lambda opt: [triton.cdiv(M, opt.d('TM'))*triton.cdiv(N, opt.d('TN'))])
+        alpha = 1.
+        args = [a.data_ptr(), b.data_ptr(), c.data_ptr(), alpha, M, N, K, lda, ldb, ldc, locks.data_ptr()]
+        grid = lambda opt: [triton.cdiv(M, opt.TM) * triton.cdiv(N, opt.TN), 1, 1]
+        kernel(*args, grid=grid)
         return c
 
     @staticmethod
