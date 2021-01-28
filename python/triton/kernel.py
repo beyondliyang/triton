@@ -34,12 +34,6 @@ def th_to_triton(obj):
 def cdiv(a, b):
     return libtriton.cdiv(a, b)
 
-def largest_pow2_divisor(a):
-    return libtriton.largest_pow2_divisor(a)
-
-def cdiv_sum(a, b):
-    return libtriton.cdiv_sum(a, b)
-  
 def synchronize(device):
     dev_id = device.index
     dev_id = -1 if dev_id is None else dev_id
@@ -47,12 +41,18 @@ def synchronize(device):
 
 class kernel:
 
-  def __init__(self, src, device, defines = dict(), num_warps = [2, 4, 8]):
+  def __init__(self, src, device, defines = dict(), num_warps = [4]):
     self.src = src
     self.opt = libtriton.options_space()
     self.opt.defines = [(k, th_to_triton(v)) for k, v in defines.items()]
     self.opt.num_warps = num_warps
-    self.device = -1 if device.index is None else device.index
+    # device
+    assert device.type in ['cuda', 'cpu']
+    if device.type == 'cuda':
+      self.device = torch.cuda.current_device() if device.index is None else device.index
+    if device.type == 'cpu':
+      self.device = -1
+    # C++ function wrapper
     self.op_id = libtriton.make_op_id()
     libtriton.register_fn(self.op_id, self.device, self.src, self.opt)
     # debug mode
@@ -60,9 +60,9 @@ class kernel:
     # signature
     arg_types = libtriton.get_fn_signature(self.op_id)
     self.tys = ''.join([codes[x] for x in arg_types])
-    self.buf_idx = [i for i, x in enumerate(self.tys) if x == 'P']
 
   def __call__(self, *args, grid):
+    # debug mode (initialize)
     if self.is_debug:
       _args = args
       args = [x.clone() if isinstance(x, torch.Tensor) else x for x in _args]
@@ -70,11 +70,19 @@ class kernel:
         if isinstance(args[i], torch.Tensor):
           args[i] = libtriton.cuda_empty_like(args[i])
           args[i].copy_(_args[i])
+    # initialize cuda device if necessary
     libtriton.cuda_set_device(self.device)
+    # pack parameters into a byte buffer
     params = pack(self.tys, *args)
+    # auto-tune if necessary
     opt = libtriton.autotune(self.op_id, self.device, params, grid)
+    # run kernel
     grid = grid(opt)
-    libtriton.launch_kernel(self.op_id, self.device, params, grid[0], grid[1], grid[2])
+    grid_0 = grid[0]
+    grid_1 = 1 if len(grid) < 2 else grid[1]
+    grid_2 = 1 if len(grid) < 3 else grid[2]
+    libtriton.launch_kernel(self.op_id, self.device, params, grid_0, grid_1, grid_2)
+    # debug mode (finalize)
     if self.is_debug:
       for i in range(len(args)):
         if isinstance(args[i], torch.Tensor):

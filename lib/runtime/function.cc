@@ -298,7 +298,10 @@ kernel* function::autotune(void* args, size_t args_size, const grid_fn_ty& grid_
   kernel* ret = nullptr;
   for(auto &x : kernels_){
     kernel* current = &*x.second;
-    double ts = tools::bench([&]() { (*current)(args, args_size, stream, grid_fn(x.first)); },
+    auto grid = grid_fn(x.first);
+    while(grid.size() < 3)
+      grid.push_back(1);
+    double ts = tools::bench([&]() { (*current)(args, args_size, stream, grid); },
                                      stream, true);
     ret = (ts < best_ts) ? current : ret;
     best_ts = std::min(ts, best_ts);

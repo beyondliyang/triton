@@ -91,6 +91,6 @@ def perf_op(dtype=th.float16, warmup=10, rep=50):
         if BT: b = b.t()
         a = a[::,::]
         b = b[::,::]
-        _0, TH_TFLOPS, _ = do_bench(lambda: th.matmul(a, b), flops = M*N*K*2, warmup = warmup, rep = rep)
-        _1, TT_TFLOPS, _ = do_bench(lambda: tt.ops.matmul(a, b), flops = M*N*K*2, warmup = warmup, rep = rep)
-        print((M, N, K), TH_TFLOPS, TT_TFLOPS)
+        TH_MS, TH_TFLOPS, _ = do_bench(lambda: th.matmul(a, b), flops = M*N*K*2, warmup = warmup, rep = rep)
+        TT_MS, TT_TFLOPS, _ = do_bench(lambda: tt.ops.matmul(a, b), flops = M*N*K*2, warmup = warmup, rep = rep)
+        print((M, N, K), TH_MS, TT_MS)

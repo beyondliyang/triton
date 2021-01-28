@@ -11,17 +11,17 @@ Let us start with something simple, and see how Triton can be used to create a c
 .. code-block:: C
 
     // Triton
-    // launch on a grid of (N  + TILE - 1) / TILE programs
+    // launch on a grid of `(N  + BLOCK - 1) // BLOCK` programs
     __global__ void add(float* z, float* x, float* y, int N){
         // program id
         int pid = get_program_id(0);
         // create arrays of pointers
-        int offset[TILE] = pid * TILE + 0 ... TILE;
-        float* pz[TILE] = z + offset;
-        float* px[TILE] = x + offset;
-        float* py[TILE] = y + offset;
+        int offset[BLOCK] = pid * BLOCK + 0 ... BLOCK;
+        float* pz[BLOCK] = z + offset;
+        float* px[BLOCK] = x + offset;
+        float* py[BLOCK] = y + offset;
         // bounds checking
-        bool check[TILE] = offset < N;
+        bool check[BLOCK] = offset < N;
         // write-back
         *?(check)pz = *?(check)px + *?(check)py;
     }
@@ -36,45 +36,58 @@ As you will see, a wrapper for the above Triton function can be created in just 
 
 .. code-block:: python
 
-    import torch
-    import triton
 
-    class _add(torch.autograd.Function):
-        # source-code for Triton compute kernel
-        src = """
+    # source-code for Triton compute kernel
+    _src = '''
     __global__ void add(float* z, float* x, float* y, int N){
         // program id
         int pid = get_program_id(0);
         // create arrays of pointers
-        int offset[TILE] = pid * TILE + 0 ... TILE;
-        float* pz[TILE] = z + offset;
-        float* px[TILE] = x + offset;
-        float* py[TILE] = y + offset;
+        int offset[BLOCK] = pid * BLOCK + 0 ... BLOCK;
+        float* pz[BLOCK] = z + offset;
+        float* px[BLOCK] = x + offset;
+        float* py[BLOCK] = y + offset;
         // bounds checking
-        bool check[TILE] = offset < N;
+        bool check[BLOCK] = offset < N;
         // write-back
         *?(check)pz = *?(check)px + *?(check)py;
     }
-        """
-        # create callable kernel for the source-code
-        # options: 4 warps and a -DTILE=1024
-        kernel = triton.kernel(src, defines = {'TILE': 1024}, num_warps = [4])
-
-        # Forward pass
+        '''
+    # This function returns a callable `triton.kernel` object
+    # created from the above source code.
+    # For portability, we maintain a cache of kernels for different `torch.device`
+    # We compile the kernel with -DBLOCK=1024
+    _kernels = dict()
+    def make_add_kernel(device):
+        if device not in _kernels:
+            defines = {'BLOCK': 1024}
+            _kernels[device] = triton.kernel(_src, device = device, defines=defines)
+        return _kernels[device]
+    
+    
+    # This is a standard torch custom autograd Function
+    # The only difference is that we can now use the above kernel
+    # in the `forward` and `backward` functions.
+    class _add(torch.autograd.Function):
+        
         @staticmethod
         def forward(ctx, x, y):
-            # type checking
+            # constraints of the op
             assert x.dtype == torch.float32
-            # allocate output
-            z = torch.empty_like(x).cuda()
-            # create launch grid
-            # this is a function of the launch parameters
-            # triton.cdiv indicates ceil division
-            N = x.numel()
-            grid = lambda opt: (triton.cdiv(N, opt.d('TILE')), )
-            # launch kernel
-            _add.kernel(z, x, y, N, grid = grid)
-            # return output
+            # *allocate output*
+            z = torch.empty_like(x)
+            # *create launch grid*:
+            # this is a function which takes compilation parameters `opt`
+            # as input and returns a grid for launching the kernel.
+            # triton.cdiv is a shortcut for ceil division:
+            # triton.cdiv(a, b) = (a + b - 1) // b
+            N = z.shape[0]
+            grid = lambda opt: (triton.cdiv(N, opt.BLOCK), )
+            # *launch kernel*:
+            # pointer to the data of torch tensors can be retrieved with
+            # the `.data_ptr()` method
+            kernel = make_add_kernel(z.device)
+            kernel(z.data_ptr(), x.data_ptr(), y.data_ptr(), N, grid = grid)
             return z
 
     # get callable from Triton function
@@ -82,21 +95,17 @@ As you will see, a wrapper for the above Triton function can be created in just 
 
     # test
     torch.manual_seed(0)
-    x = torch.rand(98432).cuda()
-    y = torch.rand(98432).cuda()
+    x = torch.rand(98432, device='cuda')
+    y = torch.rand(98432, device='cuda')
     za = x + y
     zb = add(x, y)
-    diff = (za - zb).abs().max()
-    print(diff)
-    print(torch.allclose(za,zb))
+    print(za)
+    print(zb)
+    print(f'The maximum difference between torch and triton is '
+        f'{torch.max(torch.abs(za - zb))}')
 
-Executing the above code will:
 
-- Generate a .cpp file containing PyTorch bindings for the Triton function
-- Compile this .cpp file using distutils
-- Cache the resulting custom op
-- Call the resulting custom op
+---------------
+Benchmarking
+---------------
 
-In other words, the first program run will generate and cache a bunch of files in $HOME/.triton/cache, but subsequent runs should be just as fast as using a handwritten custom operation.
-
-A runnable version of this kernel is available `here <https://github.com/ptillet/triton/tree/master/python/examples/tutorials/vec_add.py>`_.

@@ -38,7 +38,7 @@ __global__ void matmul(TYPE * A __noalias __readonly __aligned(16),
       int rm[TM] = pidm * TM + 0 ... TM;
       int rn[TN] = pidn * TN + 0 ... TN;
 
-      // split-k for better parrelism
+      // split-k for better parrallelism
       K           = K / TZ;
       int rk[TK]  = 0 ... TK;
       // pointers to operands
@@ -58,7 +58,7 @@ __global__ void matmul(TYPE * A __noalias __readonly __aligned(16),
       // reduction loop
       float acc[TM, TN] = 0;
       for(int k = K; k > 0; k -= TK){
-#ifdef K_MULTIPLE_OF_TK
+#if (IS_TK_DIV_K==1)
         bool checkk[TK] = k > TK;
 #else
         bool checkk[TK] = rk < k - TK;
@@ -66,7 +66,7 @@ __global__ void matmul(TYPE * A __noalias __readonly __aligned(16),
         bool checka[TM, TK] = checkk[newaxis, :];
         bool checkb[TK, TN] = checkk[:, newaxis];
         acc += a @ b;
-#ifdef K_MULTIPLE_OF_TK
+#if (IS_TK_DIV_K==1)
         a = *?(checka)pa;
         b = *?(checkb)pb;
 #else
@@ -102,12 +102,11 @@ __global__ void matmul(TYPE * A __noalias __readonly __aligned(16),
 #endif
 }
     """
-    TM = 128
-    TN = 128
-    TK = 32
+    TM = [128]
+    TN = [128]
+    TK = [32]
     TZ = 1
     num_warps = [4]
-    kernel = dict()
 
     @staticmethod
     def largest_pow2_divisor(N):
@@ -118,6 +117,7 @@ __global__ void matmul(TYPE * A __noalias __readonly __aligned(16),
 
         
     _locks = dict()
+    _kernels = dict()
     @staticmethod
     def _call(a, b):
         dtype = a.dtype
@@ -138,9 +138,9 @@ __global__ void matmul(TYPE * A __noalias __readonly __aligned(16),
         lda_pow2_div = _matmul.largest_pow2_divisor(lda)
         ldb_pow2_div = _matmul.largest_pow2_divisor(ldb)
         ldc_pow2_div = _matmul.largest_pow2_divisor(ldc)
-        m_k_tk      = K % 32 == 0
-        key = (device, dtype, is_a_row, is_b_row, lda_pow2_div, ldb_pow2_div, ldc_pow2_div, m_k_tk)
-        if key not in _matmul.kernel:
+        is_tk_div_k  = K % 32 == 0
+        key = (device, dtype, is_a_row, is_b_row, lda_pow2_div, ldb_pow2_div, ldc_pow2_div, is_tk_div_k)
+        if key not in _matmul._kernels:
             defines = {
                 'TYPE' : dtype,
                 'STRIDE_AM'   : 'lda' if is_a_row else '1', 
@@ -153,12 +153,11 @@ __global__ void matmul(TYPE * A __noalias __readonly __aligned(16),
                 'TM'          : _matmul.TM,
                 'TN'          : _matmul.TN,
                 'TK'          : _matmul.TK,
-                'TZ'          : _matmul.TZ
+                'TZ'          : _matmul.TZ,
+                'IS_TK_DIV_K' : is_tk_div_k
             }
-            if m_k_tk:
-                defines['K_MULTIPLE_OF_TK'] = '1'
-            _matmul.kernel[key] = triton.kernel(_matmul.src, device, num_warps=_matmul.num_warps, defines=defines)
-        kernel = _matmul.kernel[key]
+            _matmul._kernels[key] = triton.kernel(_matmul.src, device, num_warps=_matmul.num_warps, defines=defines)
+        kernel = _matmul._kernels[key]
         # # locks for split-k
         if device not in _matmul._locks:
           _matmul._locks[device] = torch.zeros(1024*1024, dtype=torch.int32, device=device)
