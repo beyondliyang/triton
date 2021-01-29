@@ -32,7 +32,7 @@ def test_op(MODE, TRANS_A, TRANS_B, BLOCK, DTYPE = torch.float16, Z = 3, H = 2, 
   shape = {'sdd': (M, N), 'dsd': (a.shape[2], a.shape[3]), 'dds': (b.shape[2], b.shape[3])}[MODE]
   layout = torch.randint(2, (H, shape[0]//BLOCK, shape[1]//BLOCK))
   # triton result
-  op = tt.ops.blocksparse_matmul(layout, BLOCK, MODE, trans_a=TRANS_A, trans_b=TRANS_B)
+  op = tt.ops.blocksparse.matmul(layout, BLOCK, MODE, trans_a=TRANS_A, trans_b=TRANS_B)
   ra = sparsify_tensor(a, layout, BLOCK) if MODE == 'dsd' else a
   rb = sparsify_tensor(b, layout, BLOCK) if MODE == 'dds' else b
   rc  = op(ra, rb)

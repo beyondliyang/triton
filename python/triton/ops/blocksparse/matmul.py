@@ -1,213 +1,15 @@
 import triton
 import triton._C.libtriton as libtriton
 import torch
+import os
 import math
 
-src = '''
-  __global__ void NAME (TYPE* A __readonly  __noalias __aligned(16),
-                        TYPE* B __readonly  __noalias __aligned(16),
-                        TYPE* C __noalias __aligned(16),
-                        int lda __multipleof(8), 
-                        int ldb __multipleof(8), 
-                        int ldc __multipleof(8),
-                        long stride_za __multipleof(8),
-                        long stride_zb __multipleof(8),
-                        long stride_zc __multipleof(8),
-                        long stride_ha __multipleof(8),
-                        long stride_hb __multipleof(8),
-                        long stride_hc __multipleof(8),
-                        int DS0, int DS1,
-                        int SDD_K __multipleof(16), 
-                        int SDD_off_width,
-                        int* lut, int* locks, int nlocks) {
-    /* ---------------- */
-    /*    Prologue      */
-    /* ---------------- */
-    // program ids
-    int pid0 = get_program_id(0);
-    int pid1 = get_program_id(1);
-    int pidz = get_program_id(2);
-#ifdef SDD
-    // load LUT header
-    pid1 = pid1 + SDD_off_width;
-    int blockidm[TM] = (0 ... TM) / BLOCK;
-    int blockidn[TN] = (0 ... TN) / BLOCK;
-    int offlutm[TM]  = blockidm*(TN/BLOCK)*4;
-    int offlutn[TN]  = blockidn*4;
-    int *header      = lut + pid1 * (TM/BLOCK) * (TN/BLOCK) * 4;
-    int z            = *(header + 0);
-    int i[TM]        = *(header + 1 + offlutm);
-    int j[TN]        = *(header + 2 + offlutn);
-    int AS1 = SDD_K / TZ;
-    int lockid = select(TZ > 1, 1, 0);
-    int offka  = pid0 * AS1;
-    int offkb  = pid0 * AS1;
-    int offmc  = 0;
-    int offnc  = 0;
-    int offpa  = 0;
-    int offpb  = 0;
-    int maxid = TZ;
-    int offhc = 0;
-    int offha = z;
-    int offhb = z;
-    int ram[TM] = i*BLOCK + ((0 ... TM) % BLOCK);
-    int rbn[TN] = j*BLOCK + ((0 ... TN) % BLOCK);
-#else
-    // load LUT header
-    int *header = lut + pid0 * 6;
-    int offset = *(header + 0);
-    int AS1    = *(header + 1);
-    int column = *(header + 2);
-    int depth  = *(header + 3);
-    int lockid = *(header + 4);
-    int maxid  = *(header + 5);
-    int *pinc  = lut + offset;
-    int offhc = depth;
-#ifdef DSD
-    // output offset
-    int offnc = pid1 * TN;
-    int offmc = column * TM;
-    int offpc = 0;
-    // dense input offset
-    int offnb = pid1 * TN;
-    int offkb __multipleof(8) = *pinc;
-    int offpb = 0;
-    // sparse input offset
-    int offma = 0;
-    int offka = 0;
-    long offpa __multipleof(8) = *(pinc + 1);
-    offpa = offpa * BLOCK * BLOCK;
-    int offha = 0;
-    int offhb = depth;
-#endif
-#ifdef DDS
-    // output offset
-    int offmc = pid1 * TM;
-    int offnc = column * TN;
-    int offpc = 0;
-    // dense input offset
-    int offma = pid1 * TM;
-    int offka __multipleof(8) = *pinc;
-    int offpa = 0;
-    // sparse input offset
-    int offnb = 0;
-    int offkb = 0;
-    long offpb __multipleof(8) = *(pinc + 1);
-    offpb = offpb * BLOCK * BLOCK;
-    int offha = depth;
-    int offhb = 0;
-#endif
-    int ram[TM] = offma + 0 ... TM;
-    int rbn[TN] = offnb + 0 ... TN;
-#endif
-    // initialize a, b pointers
-    int rka[TK] = offka + 0 ... TK;
-    int rkb[TK] = offkb + 0 ... TK;
-    TYPE* pa[TM, TK] = A + pidz * stride_za + offha * stride_ha + offpa + ram[:, newaxis] * STRIDE_AM + rka[newaxis, :] * STRIDE_AK;
-    TYPE* pb[TK, TN] = B + pidz * stride_zb + offhb * stride_hb + offpb + rbn[newaxis, :] * STRIDE_BN + rkb[:, newaxis] * STRIDE_BK;
-    // pre-fetch
-#ifdef DDS
-    bool checkam[TM, TK] = ram[:, newaxis] < DS0;
-#else
-    bool checkam[TM, TK] = AS1 > 0;
-#endif
-#ifdef DSD
-    bool checkbn[TK, TN] = rbn[newaxis, :] < DS0;
-#else
-    bool checkbn[TK, TN] = AS1 > 0;
-#endif
-    TYPE a[TM, TK] = checkam ? *pa : 0;
-    TYPE b[TK, TN] = checkbn ? *pb : 0;
-
-    /* ---------------- */
-    /*    Inner Loop    */
-    /* ---------------- */
-    // create result tile
-    float acc[TM, TN] = 0;
-    int step = TK;
-    for(int k = AS1; k > 0; k -= step) {
-      acc += a @ b;
-      // update pointers
-#ifdef SDD
-      int inc_a = TK * STRIDE_AK;
-      int inc_b = TK * STRIDE_BK;
-#else
-      pinc += 2;
-#ifdef DSD
-      int inc_b __multipleof(8) = *pinc;
-      int inc_a __multipleof(8) = *(pinc + 1);
-      inc_b = inc_b * STRIDE_BK;
-#endif
-#ifdef DDS
-      int inc_a __multipleof(8) = *pinc;
-      int inc_b __multipleof(8) = *(pinc + 1);
-      inc_a = inc_a * STRIDE_AK;
-#endif
-#endif
-      pa += inc_a;
-      pb += inc_b;
-      // pre-fetch
-      bool checkak[TM, TK] = k > TK;
-      bool checkbk[TK, TN] = k > TK;
-      bool checka[TM, TK] = checkam && checkak;
-      bool checkb[TK, TN] = checkbk && checkbn;
-      a = *?(checka)pa;
-      b = *?(checkb)pb;
-    }
-    TYPE c[TM, TN] = acc;
-
-    /* ---------------- */
-    /*    Epilogue      */
-    /* ---------------- */
-    // initialize c pointers
-#ifdef SDD
-    bool checkc[TM, TN] = 1;
-    // rematerialize
-    int rr_blockidm[TM]  = (0 ... TM) / BLOCK;
-    int rr_blockidn[TN]  = (0 ... TN) / BLOCK;
-    int rr_offlutm[TM]   = rr_blockidm*(TN/BLOCK)*4;
-    int rr_offlutn[TN]   = rr_blockidn*4;
-    int off_bkid[TM, TN] = 3 + rr_offlutm[:, newaxis] + rr_offlutn[newaxis, :];
-    int bkid[TM, TN]     = *(header + off_bkid);
-    long offpc[TM, TN]   = bkid * BLOCK * BLOCK;
-    // range within blocks
-    int   rcm[TM]    = (0 ... TM) % BLOCK;
-    int   rcn[TN]    = (0 ... TN) % BLOCK;
-#else
-    int   rcm[TM]    = offmc + 0 ... TM;
-    int   rcn[TN]    = offnc + 0 ... TN;
-#ifdef DSD
-    bool checkc[TM, TN] = rcn[newaxis, :] < DS0;
-#endif
-#ifdef DDS
-    bool checkc[TM, TN] = rcm[:, newaxis] < DS0;
-#endif
-#endif
-    TYPE* pc[TM, TN] = C + offpc + offhc*stride_hc + pidz*stride_zc + rcm[:, newaxis]*STRIDE_CM + rcn[newaxis, :]*STRIDE_CN;
-    // write-back directly
-    if(lockid == 0) {
-      *?(checkc) pc = c;
-    }
-    // accumulate partial result using spin-locks
-    else {
-      int *plock = locks + get_program_id(2)*nlocks*get_num_programs(1) + get_program_id(1)*nlocks + lockid - 1;
-      int *pcount = plock + get_num_programs(2)*get_num_programs(1)*nlocks;
-      for(int repeat = 1; repeat == 1; repeat = atomic_cas(plock, 0, 1));
-      int count = *pcount;
-      if(count == 0)
-        *?(checkc) pc = c;
-      else
-        *?(checkc) pc = c + *?(checkc)pc;
-      atomic_xchg(pcount, (count + 1) % maxid);
-      atomic_xchg(plock, 0);
-    }
-  }
-'''
+src = triton.read(os.path.join(os.path.dirname(__file__), 'matmul.c'))
 
 ##############
 #  MAIN API  #
 ##############
-class _blocksparse_matmul(torch.autograd.Function):
+class _matmul(torch.autograd.Function):
   
   sdd_cache = dict()
   dsd_cache = dict()
@@ -268,10 +70,10 @@ class _blocksparse_matmul(torch.autograd.Function):
   
   @staticmethod
   def get_locks(size, dev):
-    if dev not in _blocksparse_matmul.locks or \
-        size > _blocksparse_matmul.locks[dev].size(0):
-      _blocksparse_matmul.locks[dev] = torch.zeros(size, dtype=torch.int32, device=dev)
-    return _blocksparse_matmul.locks[dev]
+    if dev not in _matmul.locks or \
+        size > _matmul.locks[dev].size(0):
+      _matmul.locks[dev] = torch.zeros(size, dtype=torch.int32, device=dev)
+    return _matmul.locks[dev]
 
   ##########################
   # SPARSE = DENSE x DENSE #
@@ -323,7 +125,7 @@ class _blocksparse_matmul(torch.autograd.Function):
     for lut, width, pack in zip(luts, widths, packs):
       num_lock = 1
       key = (block, device, a.dtype, b.dtype, trans_a, trans_b, trans_c, pack, is_32_multiple, is_64_multiple)
-      if key not in _blocksparse_matmul.sdd_cache:
+      if key not in _matmul.sdd_cache:
         F32TK  = [8, 16]
         #F16TK  = [16]
         #F16TK += [32] if is_32_multiple else []
@@ -339,11 +141,11 @@ class _blocksparse_matmul(torch.autograd.Function):
                     'STRIDE_BK': '1'    if trans_b else 'ldb',
                     'STRIDE_CM': 'ldc', 'STRIDE_CN': '1',
                     'SDD': True, 'TZ': 1, 'NAME': 'sdd_kernel'}
-        _blocksparse_matmul.sdd_cache[key] = triton.kernel(src, device=device, defines=defines, num_warps=[1, 2, 4])
+        _matmul.sdd_cache[key] = triton.kernel(src, device=device, defines=defines, num_warps=[1, 2, 4])
 
-      kernel = _blocksparse_matmul.sdd_cache[key]
+      kernel = _matmul.sdd_cache[key]
       # create output
-      locks = _blocksparse_matmul.get_locks(2*width*AS0*num_lock, a.device)
+      locks = _matmul.get_locks(2*width*AS0*num_lock, a.device)
       # maximum grid size is 65535
       # so operation might be decomposed into multiple
       # kernel calls
@@ -382,7 +184,7 @@ class _blocksparse_matmul(torch.autograd.Function):
         sizes = torch.sum(layout[z, :, :], 1)
       else:
         sizes = torch.sum(layout[z, :, :], 0)
-      z_segments, z_column, z_lockid, z_maxid, z_offsets = _blocksparse_matmul.load_balance(sizes, block)
+      z_segments, z_column, z_lockid, z_maxid, z_offsets = _matmul.load_balance(sizes, block)
       z_depth = z * torch.ones_like(z_segments)
       z_lockid[z_lockid > 0] += current_maxid
       current_maxid = z_lockid.max()
@@ -467,7 +269,7 @@ class _blocksparse_matmul(torch.autograd.Function):
     dtype = a.dtype
     # kernel
     key = (block, a.device, a.dtype, b.dtype, trans_a, trans_b, trans_c)
-    if key not in _blocksparse_matmul.dds_cache:
+    if key not in _matmul.dds_cache:
       TM = [64, 128] if dtype == torch.float32 else [64, 128, 256]
       TK = [8]       if dtype == torch.float32 else [16]
       defines = {'TM': TM, 'TN': block, 'TK': TK, 
@@ -481,14 +283,14 @@ class _blocksparse_matmul(torch.autograd.Function):
                  'STRIDE_CN': 'ldc' if trans_c else '1',
                  'NAME': 'dds_kernel',
                  'DDS': True}
-      _blocksparse_matmul.dds_cache[key] = triton.kernel(src, device=a.device, defines=defines, num_warps=[4])
-    kernel = _blocksparse_matmul.dds_cache[key]
+      _matmul.dds_cache[key] = triton.kernel(src, device=a.device, defines=defines, num_warps=[4])
+    kernel = _matmul.dds_cache[key]
     # output
     CS0 = AS0
     CS1 = AS1
     CS2 = BS2 if trans_c else AS2
     CS3 = AS2 if trans_c else BS2
-    locks = _blocksparse_matmul.get_locks(2*AS0*AS2//32*num_locks, a.device)
+    locks = _matmul.get_locks(2*AS0*AS2//32*num_locks, a.device)
     c = torch.empty((CS0, CS1, CS2, CS3), dtype=dtype, device=a.device)
     kernel(a.data_ptr(), b.data_ptr(), c.data_ptr(), 
            a.stride(2), block, c.stride(2), 
@@ -512,7 +314,7 @@ class _blocksparse_matmul(torch.autograd.Function):
     dtype = a.dtype
     # kernel
     key = (block, a.device, a.dtype, b.dtype, trans_a, trans_b, trans_c)
-    if key not in _blocksparse_matmul.dsd_cache:
+    if key not in _matmul.dsd_cache:
       TN = [64, 128] if dtype == torch.float32 else [64, 128]
       TK = [8]       if dtype == torch.float32 else [16]
       defines = {'TM': block, 'TN': TN, 'TK': TK, 
@@ -526,14 +328,14 @@ class _blocksparse_matmul(torch.autograd.Function):
                  'STRIDE_CN': 'ldc' if trans_c else '1',
                  'NAME': 'dsd_kernel',
                  'DSD': True}
-      _blocksparse_matmul.dsd_cache[key] = triton.kernel(src, device=a.device, defines=defines, num_warps=[4])
-    kernel = _blocksparse_matmul.dsd_cache[key]
+      _matmul.dsd_cache[key] = triton.kernel(src, device=a.device, defines=defines, num_warps=[4])
+    kernel = _matmul.dsd_cache[key]
     # output
     CS0 = BS0
     CS1 = BS1
     CS2 = BS3 if trans_c else AS1
     CS3 = AS1 if trans_c else BS3
-    locks = _blocksparse_matmul.get_locks(2*BS0*BS3//32*num_locks, a.device)
+    locks = _matmul.get_locks(2*BS0*BS3//32*num_locks, a.device)
     c = torch.empty((CS0, CS1, CS2, CS3), dtype=dtype, device=a.device)
     kernel(a.data_ptr(), b.data_ptr(), c.data_ptr(), 
            block, b.stride(2), c.stride(2), 
@@ -553,7 +355,7 @@ class _blocksparse_matmul(torch.autograd.Function):
               c_lut, c_num_locks, c_width, c_packs, 
               da_lut, da_num_locks, da_width, da_packs,
               db_lut, db_num_locks, db_width, db_packs):
-    c = _blocksparse_matmul.fn[mode](a, b, trans_a, trans_b, trans_c, spdims, block, 
+    c = _matmul.fn[mode](a, b, trans_a, trans_b, trans_c, spdims, block, 
                                 c_lut, c_num_locks, c_width, c_packs)
     # save for backward
     ctx.save_for_backward(a, b)
@@ -580,12 +382,12 @@ class _blocksparse_matmul(torch.autograd.Function):
     # gradients w.r.t. a
     if ctx.needs_input_grad[0]:
       mode_da = mode[1] + mode[0] + mode[2]
-      da = _blocksparse_matmul.fn[mode_da](dc, b, False, not ctx.trans_b, ctx.trans_a, ctx.spdims, ctx.block,
+      da = _matmul.fn[mode_da](dc, b, False, not ctx.trans_b, ctx.trans_a, ctx.spdims, ctx.block,
                          ctx.da_lut, ctx.da_num_locks, ctx.da_width, ctx.da_packs)
     # gradients w.r.t. b
     if ctx.needs_input_grad[1]:
       mode_db = mode[2] + mode[1] + mode[0]
-      db = _blocksparse_matmul.fn[mode_db](a, dc, not ctx.trans_a, False, ctx.trans_b, ctx.spdims, ctx.block,
+      db = _matmul.fn[mode_db](a, dc, not ctx.trans_a, False, ctx.trans_b, ctx.spdims, ctx.block,
                          ctx.db_lut, ctx.db_num_locks, ctx.db_width, ctx.db_packs)
     return da, db, None, None, None,\
            None, None, None, None,\
@@ -593,7 +395,7 @@ class _blocksparse_matmul(torch.autograd.Function):
            None, None, None, None, None, None,\
            None, None, None, None, None, None
 
-class blocksparse_matmul:
+class matmul:
   
   def make_lut(self, dtype, device):
     key = (dtype, device)
@@ -603,25 +405,25 @@ class blocksparse_matmul:
     layout, block = self.layout, self.block
     step = 8 if dtype == torch.float32 else 16
     if self.mode == 'sdd':
-      c_lut, c_num_locks, c_width, c_packs = _blocksparse_matmul.make_sdd_lut(layout, block, dtype, device)
+      c_lut, c_num_locks, c_width, c_packs = _matmul.make_sdd_lut(layout, block, dtype, device)
     elif self.mode == 'dsd':
-      c_lut, c_num_locks, c_width, c_packs = _blocksparse_matmul.make_dxx_lut(layout, block, step, not self.trans_a, device)
+      c_lut, c_num_locks, c_width, c_packs = _matmul.make_dxx_lut(layout, block, step, not self.trans_a, device)
     elif self.mode == 'dds':
-      c_lut, c_num_locks, c_width, c_packs = _blocksparse_matmul.make_dxx_lut(layout, block, step, self.trans_b, device)
+      c_lut, c_num_locks, c_width, c_packs = _matmul.make_dxx_lut(layout, block, step, self.trans_b, device)
     # DA look-up table
     if self.mode == 'sdd':
-      da_lut, da_num_locks, da_width, da_packs = _blocksparse_matmul.make_dxx_lut(layout, block, step, True, device)
+      da_lut, da_num_locks, da_width, da_packs = _matmul.make_dxx_lut(layout, block, step, True, device)
     elif self.mode == 'dsd':
-      da_lut, da_num_locks, da_width, da_packs = _blocksparse_matmul.make_sdd_lut(layout, block, dtype, device)
+      da_lut, da_num_locks, da_width, da_packs = _matmul.make_sdd_lut(layout, block, dtype, device)
     elif self.mode == 'dds':
-      da_lut, da_num_locks, da_width, da_packs = _blocksparse_matmul.make_dxx_lut(layout, block, step, not self.trans_b, device)
+      da_lut, da_num_locks, da_width, da_packs = _matmul.make_dxx_lut(layout, block, step, not self.trans_b, device)
     # DB look-up table
     if self.mode == 'sdd':
-      db_lut, db_num_locks, db_width, db_packs = _blocksparse_matmul.make_dxx_lut(layout, block, step, False, device)
+      db_lut, db_num_locks, db_width, db_packs = _matmul.make_dxx_lut(layout, block, step, False, device)
     elif self.mode == 'dsd':
-      db_lut, db_num_locks, db_width, db_packs = _blocksparse_matmul.make_dxx_lut(layout, block, step, self.trans_a, device)
+      db_lut, db_num_locks, db_width, db_packs = _matmul.make_dxx_lut(layout, block, step, self.trans_a, device)
     elif self.mode == 'dds':
-      db_lut, db_num_locks, db_width, db_packs = _blocksparse_matmul.make_sdd_lut(layout, block, dtype, device)
+      db_lut, db_num_locks, db_width, db_packs = _matmul.make_sdd_lut(layout, block, dtype, device)
     self.lut_cache[key] = (c_lut, c_num_locks, c_width, c_packs,\
                            da_lut, da_num_locks, da_width, da_packs,\
                            db_lut, db_num_locks, db_width, db_packs)
@@ -654,10 +456,10 @@ class blocksparse_matmul:
     da_lut, da_num_locks, da_width, da_packs,\
     db_lut, db_num_locks, db_width, db_packs = self.make_lut(a.dtype, a.device)
     # pad shapes with ones
-    a = blocksparse_matmul._pad_shape(a, self.mode == 'dsd')
-    b = blocksparse_matmul._pad_shape(b, self.mode == 'dds')
+    a = matmul._pad_shape(a, self.mode == 'dsd')
+    b = matmul._pad_shape(b, self.mode == 'dds')
     # execute
-    c = _blocksparse_matmul.apply(a, b, self.trans_a, self.trans_b, False,
+    c = _matmul.apply(a, b, self.trans_a, self.trans_b, False,
                                 self.mode, self.spdims, self.block,
                                 c_lut, c_num_locks, c_width,    c_packs, 
                                 da_lut, da_num_locks, da_width, da_packs,

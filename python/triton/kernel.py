@@ -39,6 +39,12 @@ def synchronize(device):
     dev_id = -1 if dev_id is None else dev_id
     libtriton.synchronize(dev_id)
 
+def read(path):
+  with open(path, 'r') as f:
+    source = f.read()
+  return source
+
+
 class kernel:
 
   def __init__(self, src, device, defines = dict(), num_warps = [4]):

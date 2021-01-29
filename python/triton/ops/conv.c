@@ -1,16 +1,9 @@
-import torch
-import triton
-
-class _conv(torch.autograd.Function):
-    src = """
-    __global__ void conv(TYPE *A __noalias __readonly __aligned(16), 
+__global__ void conv(TYPE *A __noalias __readonly __aligned(16), 
                          TYPE *B __noalias __readonly __aligned(16), 
                          TYPE *C __noalias __aligned(16), 
                          float alpha,
                          // equivalent matmul
-                         int M __retune,
-                         int N __retune,
-                         int K __retune,
+                         int M, int N,  int K,
                          // convolution properties
                          int pad_h, int pad_w, int stride_h, int stride_w,
                          // pointer increment
@@ -131,72 +124,3 @@ class _conv(torch.autograd.Function):
       atomic_xchg(plock, 0);
 #endif
 }
-    """
-
-    kernel = dict()
-
-    @staticmethod
-    def unpack(IDX, CI, R, S):
-      s  = IDX %  S
-      cr = IDX // S
-      r  = cr  %  R
-      ci = cr  // R
-      return ci, r, s
-
-    @staticmethod
-    def forward(ctx, a, b, pad, stride, time):
-      # create kernel if necessary
-      dtype = a.dtype
-      # shapes
-      Z, CI, H, W = a.shape
-      _, R, S, CO = b.shape
-      P = (H + 2*pad[0] - R)//stride[0] + 1
-      Q = (W + 2*pad[1] - S)//stride[1] + 1
-      # compile kernel
-      if dtype not in _conv.kernel:
-          TK = 8
-          defines = {
-              'TYPE' : dtype,
-              'TM'   : [16, 32, 64, 128],
-              'TN'   : [16, 32, 64, 128],
-              'TK'   : [TK],
-              'TZ'   : [1],
-              'HH': H, 'WW': W, 'PP': P, 'QQ': Q, 'SS': S, 'RR': R,
-          }
-          idx = torch.arange(CI*R*S)
-          ci,   r,  s = _conv.unpack(idx, CI, R, S)
-          nci, nr, ns = _conv.unpack(idx + TK, CI, R, S)
-          delta = (nci - ci)*a.stride(1) + (nr - r)*a.stride(2) + (ns - s)*a.stride(3)
-          delta = delta.type(torch.int32).cuda()
-          _conv.kernel[dtype] = (delta, triton.kernel(_conv.src, num_warps=[2, 4], defines=defines))
-      delta, kernel = _conv.kernel[dtype]
-      # allocate output
-      c = torch.empty([Z, CO, P, Q], dtype=dtype)
-      # enqueue
-      grid = lambda opt: [triton.cdiv(Z*P*Q, opt.d('TM')), 
-                          triton.cdiv(CO, opt.d('TN'))]
-      time[0] = kernel(a, b, c, 1., Z*P*Q, CO, CI*R*S, 
-                    pad[0], pad[1], stride[0], stride[1],
-                    delta,
-                    a.stride(0), a.stride(1), a.stride(2), a.stride(3),
-                    b.stride(0), b.stride(1), b.stride(2), b.stride(3),
-                    c.stride(0), c.stride(1), c.stride(2), c.stride(3),
-                    grid=grid, bench=100)
-      return c
-
-
-
-conv = _conv.apply
-torch.manual_seed(0)
-Z, H, W, CI, CO, R, S = 1, 56, 56, 1024, 1024, 3, 3
-pad = (1, 1)
-stride = (1, 1)
-a = torch.rand((Z, CI, H, W)).cuda()
-b = torch.rand((CI, R, S, CO)).cuda()
-time = [None]
-cc = torch.nn.functional.conv2d(a, b.permute(3,0,1,2), None, stride, pad, [1, 1])
-c = conv(a, b, pad, stride, time)
-print((cc - c).abs().max() / max(cc.max(), c.max()))
-print(time[0], 2*Z*H*W*CI*CO*R*S/(time[0]*1e-9)*1e-12)
-#zc  = torch.matmul(a,b)
-#zc_ = dot(a,b)

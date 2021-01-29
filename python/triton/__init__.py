@@ -10,4 +10,4 @@ def cleanup():
   libtriton.cleanup()
 
 from .kernel import *
-from .ops import *
+from . import ops
