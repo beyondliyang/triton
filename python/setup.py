@@ -95,15 +95,6 @@ class CMakeBuild(build_ext):
         subprocess.check_call(['cmake', '--build', '.'] + build_args, cwd=self.build_temp)
 
 
-find_llvm()
-
-directories = [x[0] for x in os.walk(os.path.join('src', 'include'))]
-data = []
-for d in directories:
-    for htype in ['h', 'hpp']:
-        files = glob.glob(os.path.join(d, f'*.{htype}'), recursive=False)
-        data += [os.path.relpath(f, 'src') for f in files]
-
 setup(
     name='triton',
     version='0.3.0',
@@ -112,8 +103,9 @@ setup(
     description='A language and compiler for custom Deep Learning operations',
     long_description='',
     packages=['triton', 'triton/_C', 'triton/ops', 'triton/ops/blocksparse'],
-    install_requires=['numpy', 'torch', 'sympy'],
-    package_data={'': data},
+    install_requires=['numpy', 'torch'],
+    package_data={'triton': ['matmul.c', 'conv.c']},
+    include_package_data=True,
     ext_modules=[CMakeExtension('triton', 'triton/_C/')],
     cmdclass=dict(build_ext=CMakeBuild),
     zip_safe=False,
