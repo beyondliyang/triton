@@ -124,7 +124,6 @@ llvm::Attribute generator::cvt(ir::attribute attr) {
     case ir::readonly: return llvm::Attribute::get(*ctx_, llvm::Attribute::ReadOnly);
     case ir::writeonly: return llvm::Attribute::get(*ctx_, llvm::Attribute::WriteOnly);
     case ir::aligned: return llvm::Attribute::get(*ctx_, llvm::Attribute::Alignment, attr.get_value());
-    case ir::retune: return llvm::Attribute::get(*ctx_, llvm::Attribute::None);
     default: throw std::runtime_error("cannot convert ir::attribute_t to llvm::Attribute");
   }
 }
@@ -407,7 +406,10 @@ void generator::visit_load_inst(ir::load_inst* x){
       PHINode *_ret = phi(ptr->getType()->getPointerElementType(), 2);
       Instruction *then_term;
       Instruction *else_term;
+      builder_->SetInsertPoint(_ret->getParent());
+      Instruction* dummy = builder_->CreateRet(nullptr);
       llvm::SplitBlockAndInsertIfThenElse(vals_[mx->get_mask_operand()][idx], _ret, &then_term, &else_term);
+      dummy->removeFromParent();
       builder_->SetInsertPoint(then_term);
       Value* then_ret = load(ptr);
       builder_->SetInsertPoint(else_term);
@@ -461,7 +463,10 @@ void generator::visit_store_inst(ir::store_inst * x){
     if(mx){
       Value *msk = vals_[mx->get_mask_operand()][idx];
       Instruction *no_op = intrinsic(Intrinsic::donothing, {}, {});
+      builder_->SetInsertPoint(no_op->getParent());
+      Instruction* dummy = builder_->CreateRet(nullptr);
       Instruction *term = llvm::SplitBlockAndInsertIfThen(msk, no_op, false);
+      dummy->removeFromParent();
       builder_->SetInsertPoint(term);
       store(val, ptr);
       builder_->SetInsertPoint(no_op);
@@ -1236,7 +1241,10 @@ void generator::visit_reduce1d_inst(ir::reduce_inst* x, std::function<Value*(Val
   // reduce across warps
   Value *cond = icmp_eq(warp, i32(0));
   Instruction *barrier = add_barrier();
+  builder_->SetInsertPoint(barrier->getParent());
+  Instruction* dummy = builder_->CreateRet(nullptr);
   Instruction *term = llvm::SplitBlockAndInsertIfThen(cond, barrier, false);
+  dummy->removeFromParent();
   builder_->SetInsertPoint(term);
   Value* ret = load(gep(base, thread));
   for(int i = (num_warps_+1)/2; i > 0; i >>= 1){

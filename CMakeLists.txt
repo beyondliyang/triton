@@ -25,21 +25,28 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__STDC_FORMAT_MACROS -fvisibility=default -std=gnu++14")
 
 
-
 ##########
 # LLVM
 ##########
 get_cmake_property(_variableNames VARIABLES)
 set(__variableNames ${_variableNames})
 
-configure_file(cmake/DownloadLLVM.in ${TRITON_LLVM_BUILD_DIR}/llvm-download/CMakeLists.txt)
-execute_process(COMMAND "${CMAKE_COMMAND}" -G "${CMAKE_GENERATOR}" .
-    WORKING_DIRECTORY "${TRITON_LLVM_BUILD_DIR}/llvm-download"
-)
-execute_process(COMMAND "${CMAKE_COMMAND}" --build .
-    WORKING_DIRECTORY "${TRITON_LLVM_BUILD_DIR}/llvm-download"
-)
-set(LLVM_TARGETS_TO_BUILD "NVPTX" CACHE INTERNAL "")
+if(DIRECT_SASS)
+    set(LLVM_SRC_DIR ${DIRECT_SASS})
+    set(LLVM_TARGETS_TO_BUILD "GASS")
+else()
+    configure_file(cmake/DownloadLLVM.in ${TRITON_LLVM_BUILD_DIR}/llvm-download/CMakeLists.txt)
+    execute_process(COMMAND "${CMAKE_COMMAND}" -G "${CMAKE_GENERATOR}" .
+        WORKING_DIRECTORY "${TRITON_LLVM_BUILD_DIR}/llvm-download"
+    )
+    execute_process(COMMAND "${CMAKE_COMMAND}" --build .
+        WORKING_DIRECTORY "${TRITON_LLVM_BUILD_DIR}/llvm-download"
+    )
+    set(LLVM_SRC_DIR "${TRITON_LLVM_BUILD_DIR}/llvm-src")
+endif()
+
+
+set(LLVM_TARGETS_TO_BUILD "${LLVM_TARGETS_TO_BUILD};NVPTX" CACHE INTERNAL "")
 set(LLVM_BUILD_RUNTIME "OFF" CACHE INTERNAL "")
 set(LLVM_BUILD_RUNTIMES "OFF" CACHE INTERNAL "")
 set(LLVM_BUILD_TOOLS "OFF" CACHE INTERNAL "")
@@ -52,7 +59,11 @@ set(LLVM_INCLUDE_RUNTIME "OFF" CACHE INTERNAL "")
 set(LLVM_INCLUDE_TESTS "OFF" CACHE INTERNAL "")
 set(LLVM_INCLUDE_TOOLS "OFF" CACHE INTERNAL "")
 set(LLVM_INCLUDE_UTILS "OFF" CACHE INTERNAL "")
-add_subdirectory(${TRITON_LLVM_BUILD_DIR}/llvm-src
+
+
+
+
+add_subdirectory(${LLVM_SRC_DIR}
                  ${TRITON_LLVM_BUILD_DIR}/llvm-build)
 get_property(LLVM_LIBRARIES GLOBAL PROPERTY LLVM_COMPONENT_LIBS)
 # remove LLVM-specific variables so we don't pollute GUI
@@ -63,7 +74,7 @@ foreach (_variableName ${_variableNames})
     unset(${_variableName} CACHE)
 endforeach()
 include_directories("${TRITON_LLVM_BUILD_DIR}/llvm-build/include/"
-                    "${TRITON_LLVM_BUILD_DIR}/llvm-src/include/")
+                    "${LLVM_SRC_DIR}/include/")
 
 # Python module
 if(BUILD_PYTHON_MODULE)
