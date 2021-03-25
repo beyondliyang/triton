@@ -87,8 +87,8 @@ __global__ void add(float* z, float* x, float* y, int N){
 def make_add_kernel(device):
     cache = make_add_kernel.cache
     if device not in cache:
-        defines = {'BLOCK': 1024}
-        cache[device] = triton.kernel(_src, device=device, defines=defines)
+        defines = {'BLOCK': 128}
+        cache[device] = triton.kernel(_src, device=device, defines=defines, direct_sass=True)
     return cache[device]
 
 

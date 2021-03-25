@@ -39,6 +39,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/TargetRegistry.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -89,9 +90,9 @@ module::module(host_module_t mod, bool has_ownership)
 }
 
 
-module* module::create(driver::device* device, std::unique_ptr<llvm::Module> src) {
+module* module::create(driver::device* device, std::unique_ptr<llvm::Module> src, bool direct_sass) {
   switch(device->backend()){
-    case CUDA: return new cu_module(device, std::move(src));
+    case CUDA: return new cu_module(device, std::move(src), direct_sass);
     case Host: return new host_module(std::move(src));
     default: throw std::runtime_error("unknown backend");
   }
@@ -212,7 +213,7 @@ static std::map<int, int> vptx = {
   {11020, 72}
 };
 
-std::string cu_module::compile_llvm_module(std::unique_ptr<llvm::Module> module, driver::device* device) {
+std::string cu_module::compile_llvm_module_nvptx(std::unique_ptr<llvm::Module> module, driver::device* device) {
   // LLVM version in use may not officially support target hardware
   int max_nvvm_cc = 75;
   int max_nvvm_ptx = 64;
@@ -241,7 +242,6 @@ std::string cu_module::compile_llvm_module(std::unique_ptr<llvm::Module> module,
   std::string proc = "sm_" + std::to_string(std::min(cc, max_nvvm_cc));
   std::string layout = "";
   std::string features = "+ptx" + std::to_string(std::min(ptx, max_nvvm_ptx));
-  init_llvm();
   // verify and store llvm
   llvm::legacy::PassManager pm;
   pm.add(llvm::createVerifierPass());
@@ -281,42 +281,7 @@ std::string cu_module::compile_llvm_module(std::unique_ptr<llvm::Module> module,
 }
 
 void cu_module::init_from_ptx(const std::string& ptx) {
-  // JIT compile source-code
-//  std::cout << ptx << std::endl;
-
   try{
-//    // compile ptx with ptxas
-//    char _fsrc[] = "/tmp/triton_k_XXXXXX";
-//    char _flog[] = "/tmp/triton_l_XXXXXX";
-//    int fdsrc = mkstemp(_fsrc);
-//    int fdlog = mkstemp(_flog);
-//    std::string fsrc = _fsrc;
-//    std::string flog = _flog;
-//    std::ofstream ofs(fsrc);
-//    ofs << ptx;
-//    ofs.close();
-//    std::string cmd;
-//    int err;
-//    driver::cu_device* cu_device = (driver::cu_device*)device;
-//    cmd = "ptxas -v --gpu-name=sm_" + std::to_string(cu_device->compute_capability()) + " " + fsrc + " -o " + fsrc + ".o 2> " + flog;
-//    err = system(cmd.c_str());
-//    dispatch::cuModuleLoad(&*cu_, (fsrc + ".o").c_str());
-//    std::ifstream file(flog);
-//    std::string log;
-//    if(file)
-//      while (!file.eof()) log.push_back(file.get());
-//    unlink(_fsrc);
-//    unlink(_flog);
-
-//    std::smatch match;
-//    std::regex expr ("\\b([0-9]+) bytes spill");
-//    spilled_ = 0;
-//    while (std::regex_search (log,match,expr)){
-//      spilled_ += std::stoi(match[1]);
-//      log = match.suffix();
-//    }
-//    std::cout << log << std::endl;
-
     CUjit_option opt[] = {CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES, CU_JIT_ERROR_LOG_BUFFER,
                           CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES, CU_JIT_INFO_LOG_BUFFER,
                           CU_JIT_LOG_VERBOSE};
@@ -328,31 +293,18 @@ void cu_module::init_from_ptx(const std::string& ptx) {
     dispatch::cuModuleLoadDataEx(&*cu_, ptx_.data(), 5, opt, optval);
     std::string err(_err);
     std::string log(_log);
-//    std::smatch match;
-//    std::regex expr ("\\b([0-9]+) bytes spill");
-//    spilled_ = 0;
-//    while (std::regex_search(log,match,expr)){
-//      spilled_ += std::stoi(match[1]);
-//      log = match.suffix();
-//    }
   }
   catch(exception::cuda::invalid_ptx const &){
-//#ifdef TRITON_LOG_PTX_ERROR
     std::cout << ptx << std::endl;
     std::cerr << "It appears that Triton produced invalid PTX code:" << std::endl;
-//    exit(1);
-//#endif
     throw;
   }
 }
 
-cu_module::cu_module(driver::device* device, std::unique_ptr<llvm::Module> ll_module): module(CUmodule(), true) {
-  llvm::raw_string_ostream oss(llir_);
-  oss << *ll_module;
-  oss.flush();
+void cu_module::init_nvptx(driver::device* device, std::unique_ptr<llvm::Module> ll_module){
   std::string cache_path = tools::getenv("TRITON_DEBUG_CACHE_PATH");
   if(cache_path.empty())
-    ptx_ = compile_llvm_module(std::move(ll_module), device);
+    ptx_ = compile_llvm_module_nvptx(std::move(ll_module), device);
   else{
     tools::mkdir(cache_path);
     // update cache path to PTX file
@@ -370,12 +322,74 @@ cu_module::cu_module(driver::device* device, std::unique_ptr<llvm::Module> ll_mo
     ptx_ = _ptx.str();
     // compile and write-back if read empty
     if(ptx_.empty()){
-      ptx_ = compile_llvm_module(std::move(ll_module), device);
+      ptx_ = compile_llvm_module_nvptx(std::move(ll_module), device);
       std::ofstream ofs(cache_path);
       ofs << ptx_;
     }
   }
   init_from_ptx(ptx_);
+}
+
+
+void cu_module::init_direct_sass(driver::device* device, std::unique_ptr<llvm::Module> module){
+    llvm::SmallVector<char, 0> buffer;
+    // create machine
+    std::string error;
+    module->setTargetTriple("gass");
+    auto target = llvm::TargetRegistry::lookupTarget(module->getTargetTriple(), error);
+    llvm::TargetOptions opt;
+    llvm::TargetMachine *machine = target->createTargetMachine(module->getTargetTriple(), "sm_70", "", opt,
+                                                               llvm::Reloc::PIC_, llvm::None, llvm::CodeGenOpt::Aggressive);
+    module->setDataLayout(machine->createDataLayout());
+    // emit machine code
+//    for (llvm::Function &f : module->functions())
+//      f.addFnAttr(llvm::Attribute::AlwaysInline);
+    llvm::legacy::PassManager pass;
+    auto BOS = std::make_unique<llvm::raw_svector_ostream>(buffer);
+    llvm::raw_pwrite_stream *OS = BOS.get();
+    // emit
+    machine->addPassesToEmitFile(pass, *OS, nullptr, llvm::CodeGenFileType::CGFT_ObjectFile);
+    pass.run(*module);
+    {
+      // Figure out where we are going to send the output.
+      std::error_code EC;
+      auto Out = std::make_unique<llvm::ToolOutputFile>(
+            "/tmp/triton-gass.cubin", EC, llvm::sys::fs::OF_None);
+      Out->os() << buffer;
+      Out->keep();
+    }
+    try {
+      unsigned int errbufsize = 8192;
+      unsigned int logbufsize = 8192;
+      char _err[errbufsize];
+      char _log[logbufsize];
+      CUjit_option JitOpt[] = {CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+                               CU_JIT_ERROR_LOG_BUFFER,
+                               CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+                               CU_JIT_INFO_LOG_BUFFER,
+                               CU_JIT_LOG_VERBOSE};
+      void* optval[] = {(void*)(uintptr_t)errbufsize, (void*)_err,
+                        (void*)(uintptr_t)logbufsize, (void*)_log, (void*)1};
+      std::vector<char> result(buffer.begin(), buffer.end());
+      std::cout << "Check load module: " <<
+          dispatch::cuModuleLoadDataEx(&*cu_, result.data(), 5, JitOpt,
+                                   optval) << "\n";
+    } catch(exception::cuda::invalid_ptx const &){
+      std::cerr << "It appears that GASS produced invalid code:" << std::endl;
+      throw;
+    }
+}
+
+cu_module::cu_module(driver::device* device, std::unique_ptr<llvm::Module> ll_module, bool direct_sass): module(CUmodule(), true) {
+  init_llvm();
+  llvm::raw_string_ostream oss(llir_);
+  oss << *ll_module;
+  oss.flush();
+  if(direct_sass)
+    init_direct_sass(device, std::move(ll_module));
+  else
+    init_nvptx(device, std::move(ll_module));
+
 }
 
 cu_module::cu_module(driver::device*, std::string const & source) : module(CUmodule(), true), ptx_(source){
@@ -393,4 +407,3 @@ std::unique_ptr<buffer> cu_module::symbol(const char *name) const{
 
 }
 }
-

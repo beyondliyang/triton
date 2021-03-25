@@ -37,7 +37,7 @@ protected:
 public:
   module(CUmodule mod, bool has_ownership);
   module(host_module_t mod, bool has_ownership);
-  static module* create(driver::device* device, std::unique_ptr<llvm::Module> src);
+  static module* create(driver::device* device, std::unique_ptr<llvm::Module> src, bool use_gass);
   void compile_llvm_module(std::unique_ptr<llvm::Module> module, const std::string& triple,
                            const std::string &proc, std::string layout,
                            llvm::SmallVectorImpl<char> &buffer,
@@ -59,11 +59,13 @@ public:
 
 // CUDA
 class cu_module: public module {
-  std::string compile_llvm_module(std::unique_ptr<llvm::Module> module, driver::device* device);
+  std::string compile_llvm_module_direct_sass(std::unique_ptr<llvm::Module> module, driver::device* device);
+  std::string compile_llvm_module_nvptx(std::unique_ptr<llvm::Module> module, driver::device* device);
   void init_from_ptx(const std::string& ptx);
-
+  void init_nvptx(driver::device* device, std::unique_ptr<llvm::Module> ll_module);
+  void init_direct_sass (driver::device* device, std::unique_ptr<llvm::Module> ll_module);
 public:
-  cu_module(driver::device* device, std::unique_ptr<llvm::Module> module);
+  cu_module(driver::device* device, std::unique_ptr<llvm::Module> module, bool direct_sass);
   cu_module(driver::device* device, const std::string& source);
   std::unique_ptr<buffer> symbol(const char * name) const;
   std::string llir() const { return llir_; }

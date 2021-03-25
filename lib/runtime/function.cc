@@ -186,7 +186,7 @@ std::tuple<std::shared_ptr<driver::module>,
   allocation.run(ir);
   barriers.run(ir);
   isel.visit(ir, *llvm);
-  std::shared_ptr<driver::module> mod(driver::module::create(dev, std::move(llvm)));
+  std::shared_ptr<driver::module> mod(driver::module::create(dev, std::move(llvm), opt.direct_sass));
   std::shared_ptr<driver::kernel> ker(driver::kernel::create(&*mod, name.c_str()));
   size_t shared_mem = allocation.allocated_size();
   return std::make_tuple(mod, ker, shared_mem);

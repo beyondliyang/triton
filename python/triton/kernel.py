@@ -61,7 +61,8 @@ class kernel:
         defines: Optional[Dict] = None,
         num_warps: int = 4,
         autotune_configs: Optional[List] = None,
-        autotune_key: Optional[List] = None
+        autotune_key: Optional[List] = None,
+        direct_sass: bool = False,
     ):
         """
         :param src: The source code of the kernel.
@@ -70,6 +71,7 @@ class kernel:
         :param num_warps: Optimization flag for the compiler's internal auto-parallelization engine.
         :param autotune_configs: A list of triton.config objects for the autotuner to try.
         :param autotune_key: A list of kernel argument names whose change in value should trigger the autotuner to re-run.
+        :param direct_sass: If True, uses the direct SASS compiler instead of PTXAS
         """
 
         if defines is None:
@@ -98,6 +100,7 @@ class kernel:
         self.opt = _triton.runtime.options()
         self.opt.defines = {k: th_to_triton(v) for k, v in defines.items()}
         self.opt.num_warps = num_warps
+        self.opt.direct_sass = direct_sass
         # autotune_configs = [({}, 4)]
         self.fn = _triton.runtime.function(self.src, self.opt, self.device, autotune_configs, autotune_key)
         self.tys = ''.join([codes[x] for x in self.fn.signature()])

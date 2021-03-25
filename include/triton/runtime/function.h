@@ -50,6 +50,7 @@ struct options_t {
   }
   std::unordered_map<std::string, std::string> defines;
   int num_warps;
+  bool direct_sass = false;
 };
 
 /* ------------------------- */

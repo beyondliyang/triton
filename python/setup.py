@@ -23,11 +23,15 @@ class CMakeExtension(Extension):
 
 class CMakeBuild(build_ext):
 
-    user_options = build_ext.user_options + [('base-dir=', None, 'base directory of Triton')]
+    user_options = build_ext.user_options + [
+        ('base-dir=', None, 'base directory of Triton'),
+        ('direct-sass-path=', None, 'path to LLVM source containing GASS backend')
+    ]
 
     def initialize_options(self):
         build_ext.initialize_options(self)
         self.base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+        self.direct_sass_path = ''
 
     def finalize_options(self):
         build_ext.finalize_options(self)
@@ -50,7 +54,7 @@ class CMakeBuild(build_ext):
 
     def build_extension(self, ext):
         # self.debug = True
-        self.debug = False
+        self.debug = True
         extdir = os.path.abspath(os.path.dirname(self.get_ext_fullpath(ext.path)))
         # create build directories
         llvm_build_dir = os.path.join(tempfile.gettempdir(), "llvm")
@@ -65,7 +69,7 @@ class CMakeBuild(build_ext):
             "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=" + extdir,
             "-DBUILD_TUTORIALS=OFF",
             "-DBUILD_PYTHON_MODULE=ON",
-            #'-DPYTHON_EXECUTABLE=' + sys.executable,
+            f'-DDIRECT_SASS={self.direct_sass_path}',
             #'-DCMAKE_VERBOSE_MAKEFILE:BOOL=ON,
             "-DTRITON_LLVM_BUILD_DIR=" + llvm_build_dir,
             "-DPYTHON_INCLUDE_DIRS=" + ";".join(python_include_dirs)

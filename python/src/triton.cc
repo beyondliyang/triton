@@ -132,6 +132,7 @@ void init_triton_runtime(py::module &&m) {
       .def(py::init<>())
       .def_readwrite("defines", &rt::options_t::defines)
       .def_readwrite("num_warps", &rt::options_t::num_warps)
+      .def_readwrite("direct_sass", &rt::options_t::direct_sass)
       .def("__getattr__", [](rt::options_t *opt, const std::string &name) {
         return opt->D<int>(name);
       });

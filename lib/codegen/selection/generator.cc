@@ -782,20 +782,16 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
   /* ---       MMA intrinsic       --- */
   /* --------------------------------- */
   Type *f16x2_ty = vec_ty(f16_ty, 2);
-  Type *ret_ty = StructType::get(*ctx_, {f32_ty, f32_ty, f32_ty, f32_ty, f32_ty, f32_ty, f32_ty, f32_ty});
-  std::vector<Type*> arg_ty = {f16x2_ty, f16x2_ty, f16x2_ty, f16x2_ty,
-                               f32_ty, f32_ty, f32_ty, f32_ty, f32_ty, f32_ty, f32_ty, f32_ty};
-  InlineAsm *mma = InlineAsm::get(FunctionType::get(ret_ty, arg_ty, false),
-                                             " mma.sync.aligned.m8n8k4."
-                                             + std::string(is_a_row ? "row" : "col")
-                                             + "."
-                                             + std::string(is_b_row ? "row" : "col")
-                                             + ".f32.f16.f16.f32 "
-                                             "{$0, $1, $2, $3, $4, $5, $6, $7}, "
-                                             "{$8, $9}, "
-                                             "{$10, $11}, "
-                                             "{$0, $1, $2, $3, $4, $5, $6, $7};", "=f,=f,=f,=f,=f,=f,=f,=f,r,r,r,r,0,1,2,3,4,5,6,7", false);
 
+  unsigned mma_intrinsic;
+  if (is_a_row && is_b_row)
+    mma_intrinsic = Intrinsic::nvvm_mma_m8n8k4_row_row_f32_f32;
+  else if (is_a_row && !is_b_row)
+    mma_intrinsic = Intrinsic::nvvm_mma_m8n8k4_row_col_f32_f32;
+  else if (!is_a_row && is_b_row)
+    mma_intrinsic = Intrinsic::nvvm_mma_m8n8k4_col_row_f32_f32;
+  else
+    mma_intrinsic = Intrinsic::nvvm_mma_m8n8k4_col_col_f32_f32;
 
   std::vector<Value*> ptr_a(num_ptr_a);
   std::vector<Value*> ptr_b(num_ptr_b);
@@ -866,7 +862,7 @@ void generator::visit_mma884(ir::dot_inst* C, ir::value *A, ir::value *B, ir::va
     for(unsigned i = 0; i < 8; i++)
       args.push_back(acc[idx[i]]);
     // execute mma
-    Value *nc = call(mma, args);
+    Value *nc = intrinsic(mma_intrinsic, {}, args);
     // unpack
     for(unsigned i = 0; i < 8; i++)
       acc[idx[i]] = extract_val(nc, {i});
