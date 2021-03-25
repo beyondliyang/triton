@@ -1,126 +1,182 @@
 import torch
 import triton
-
-autotune_configs = [
-    triton.config(defines={"MB": "128", "NB": "128", "KB": "16"}, num_warps=4),
-    # triton.config(defines={'MB': '64', 'NB': '128', 'KB': '32'}, num_warps=4),
-    # triton.config(defines={'MB': '128', 'NB': '64', 'KB': '32'}, num_warps=4),
-    # triton.config(defines={'MB': '64', 'NB': '64', 'KB': '64'}, num_warps=4),
-    # triton.config(defines={'MB': '32', 'NB': '128', 'KB': '64'}, num_warps=4),
-    # triton.config(defines={'MB': '128', 'NB': '32', 'KB': '64'}, num_warps=4),
-    # triton.config(defines={'MB': '64', 'NB': '32', 'KB': '64'}, num_warps=2),
-    # triton.config(defines={'MB': '32', 'NB': '64', 'KB': '64'}, num_warps=2)
-]
+import os
 
 autotune_key = ["M", "N", "K"]
 
 src = """
-#define MAX_GROUP_SIZE 8
+#define STM 8
+#define STN 8
 
-__global__ void dot(TYPE* A, TYPE* B, TYPE* C, 
-                   int M, int N, int K, 
-                   int lda, int ldb, int ldc) {
-  int pid = get_program_id(0);
-  int grid_m = (M + MB - 1) / MB;
-  int grid_n = (N + NB - 1) / NB;
-  int width = MAX_GROUP_SIZE * grid_n;
-  int group_id = pid / width;
-  int group_size = min(grid_m - group_id * MAX_GROUP_SIZE, MAX_GROUP_SIZE);
-  int pid_m = group_id * MAX_GROUP_SIZE + (pid % group_size);
-  int pid_n = (pid % width) / (group_size);
-  int rm[MB] = pid_m * MB + 0 ... MB;
-  int rn[NB] = pid_n * NB + 0 ... NB;
-  int rk[KB] = 0 ... KB;
-  TYPE *pa[MB, KB] = A + (rk [newaxis, :] * 1 + rm[:, newaxis] * lda);
-  TYPE *pb[KB, NB] = B + (rk[:, newaxis] * ldb + rn [newaxis, :] * 1);
-  float acc[MB, NB] = 0;
-  for (int k = K; k > 0; k -= KB) {
-    acc += (*pa) @ (*pb);
-    pa += KB * 1;
-    pb += KB * ldb;
+__global__ void matmul(TYPE *A __noalias __readonly,
+                       TYPE *B __noalias __readonly,
+                       TYPE *C __noalias,
+                       int M,
+                       int N,
+                       int K __multipleof(16),
+                       int lda,
+                       int ldb,
+                       int ldc) {
+  // prologue
+  int pidm = get_program_id(0);
+  int pidn = get_program_id(1);
+
+  // (no) swizzle for better L2 performance
+  int rm[TM] = pidm * TM + 0 ... TM;
+  int rn[TN] = pidn * TN + 0 ... TN;
+
+  int rk[TK] = 0 ... TK;
+  // pointers to operands
+  int offa[TM, TK] = rk[newaxis, :] * STRIDE_AK + rm[:, newaxis] * STRIDE_AM;
+  int offb[TK, TN] = rk[:, newaxis] * STRIDE_BK + rn [newaxis, :] * STRIDE_BN;
+  TYPE *pa[TM, TK] = A + offa;
+  TYPE *pb[TK, TN] = B + offb;
+
+  // prefetches operands
+  bool checka[TM, TK] = rk[newaxis, :] < K;
+  bool checkb[TK, TN] = rk[:, newaxis] < K;
+  TYPE a[TM, TK] = checka ? *pa : 0;
+  TYPE b[TK, TN] = checkb ? *pb : 0;
+  pa += TK * STRIDE_AK;
+  pb += TK * STRIDE_BK;
+
+  // reduction loop
+  float acc[TM, TN] = 0;
+  for (int k = K; k > 0; k -= TK) {
+    bool checkk[TK] = k > TK;
+    bool checka[TM, TK] = checkk[newaxis, :];
+    bool checkb[TK, TN] = checkk[:, newaxis];
+    acc += a @ b;
+
+    a = *? (checka)pa;
+    b = *? (checkb)pb;
+
+    pa += TK * STRIDE_AK;
+    pb += TK * STRIDE_BK;
   }
-  rm = pid_m * MB + 0 ... MB;
-  rn = pid_n * NB + 0 ... NB;
-  TYPE *pc[MB, NB] = C + (rm[:, newaxis] * ldc + rn[newaxis, :]);
-  *? (rm[:, newaxis] < M && rn [newaxis, :] < N) pc = acc;
+  TYPE c[TM, TN] = acc;
+
+  // epilogue
+  int rcm[TM] = pidm * TM + 0 ... TM;
+  int rcn[TN] = pidn * TN + 0 ... TN;
+  int offc[TM, TN] = rcm[:, newaxis] * ldc + rcn [newaxis, :];
+  TYPE *pc[TM, TN] = C + offc;
+  bool checkc[TM, TN] = rcm[:, newaxis] < M && rcn [newaxis, :] < N;
+  // *? (checkc)pc = c;
+  *pc = c;
 }
 """
 
-
-def make_kernel(device, dtype):
-    key = (device, dtype)
-    cache = make_kernel.cache
-    if key not in cache:
-        defines = {'TYPE': dtype}
-        cache[key] = triton.kernel(
-            src, device=device, defines=defines, autotune_configs=autotune_configs, autotune_key=autotune_key, direct_sass=True
-        )
-    return cache[key]
+# configs that work:
+'''
+[({"TM": "64", "TN": "64", "TK": "32"}, 4),
+ ({"TM": "64", "TN": "32", "TK": "8"}, 4),
+ ({"TM": "64", "TN": "64", "TK": "32"}, 8),
+ ({"TM": "32", "TN": "32", "TK": "8"}, 2),
+ ({"TM": "16", "TN": "16", "TK": "8"}, 2),]
+'''
 
 
-make_kernel.cache = dict()
+class _matmul(torch.autograd.Function):
 
+    _DEFAULT_CONFIGS = [
+        # ({"TM": "64", "TN": "64", "TK": "32"}, 4),
+        triton.config(defines={"TM": "128", "TN": "128", "TK": "16"}, num_warps=4),
+        # ({"TM": "128", "TN": "128", "TK": "32"}, 4),
+        # ({'TM': '64', 'TN': '128', 'TK': '32'}, 4),
+        # ({'TM': '128', 'TN': '64', 'TK': '32'}, 4),
+        # ({'TM': '32', 'TN': '32', 'TK': '8'}, 2),
+        # ({'TM': '32', 'TN': '128', 'TK': '64'}, 4),
+        # ({'TM': '128', 'TN': '32', 'TK': '64'}, 4),
+        # ({'TM': '64', 'TN': '32', 'TK': '64'}, 2),
+        # ({'TM': '32', 'TN': '64', 'TK': '64'}, 2),
+    ]
+    _CONFIGS = _DEFAULT_CONFIGS
 
-class _dot(torch.autograd.Function):
+    @staticmethod
+    def largest_pow2_divisor(N):
+        if N % 8 == 0:
+            return 8
+        if N % 4 == 0:
+            return 4
+        if N % 2 == 0:
+            return 2
+        return 1
+
+    _locks = dict()
+    _kernels = dict()
+
+    @staticmethod
+    def _call(a, b):
+        dtype = a.dtype
+        device = a.device
+        # allocate output
+        M, K = a.shape
+        K, N = b.shape
+        c = torch.zeros((M, N), dtype=dtype, device=device)
+        # kernel hash
+        is_a_row = a.stride(1) == 1
+        is_b_row = b.stride(1) == 1
+        lda = a.stride(0) if is_a_row else a.stride(1)
+        ldb = b.stride(0) if is_b_row else b.stride(1)
+        ldc = c.stride(0)
+        lda_pow2_div = _matmul.largest_pow2_divisor(lda)
+        ldb_pow2_div = _matmul.largest_pow2_divisor(ldb)
+        ldc_pow2_div = _matmul.largest_pow2_divisor(ldc)
+        is_tk_div_k = K % 64 == 0
+        key = (device, dtype, is_a_row, is_b_row, lda_pow2_div, ldb_pow2_div, ldc_pow2_div, is_tk_div_k)
+        if key not in _matmul._kernels:
+            defines = {
+                "TYPE": dtype,
+                "STRIDE_AM": "lda" if is_a_row else "1",
+                "STRIDE_AK": "1" if is_a_row else "lda",
+                "STRIDE_BK": "ldb" if is_b_row else "1",
+                "STRIDE_BN": "1" if is_b_row else "ldb",
+                "LDA_POW2_DIV": lda_pow2_div,
+                "LDB_POW2_DIV": ldb_pow2_div,
+                "LDC_POW2_DIV": ldc_pow2_div,
+            }
+            _matmul._kernels[key] = triton.kernel(
+                src,
+                device=device,
+                defines=defines,
+                autotune_configs=_matmul._CONFIGS,
+                autotune_key=["M", "N"],
+                direct_sass=True,
+            )
+        kernel = _matmul._kernels[key]
+        # enqueue
+        args = [a.data_ptr(), b.data_ptr(), c.data_ptr(), M, N, K, lda, ldb, ldc]
+        grid = lambda opt: [
+            triton.cdiv(M, opt.TM),
+            triton.cdiv(N, opt.TN),
+            1,
+        ]
+        kernel(*args, grid=grid)
+        return c
+
     @staticmethod
     def forward(ctx, a, b):
-        M, Ka = a.shape
-        Kb, N = b.shape
-        assert Ka == Kb, "incompatible dimensions"
-        assert a.is_contiguous() and b.is_contiguous(), "inputs must be contiguous"
-        c = torch.empty((M, N), device=a.device, dtype=a.dtype)
-        kernel = make_kernel(a.device, a.dtype)
-        grid = lambda opt: (triton.cdiv(M, opt.MB) * triton.cdiv(N, opt.NB), )
-        kernel(a.data_ptr(), b.data_ptr(), c.data_ptr(), \
-               M, N, Ka, \
-               a.stride(0), b.stride(0), c.stride(0), \
-
-               grid=grid)
+        c = _matmul._call(a, b)
         return c
 
 
-dot = _dot.apply
+matmul = _matmul.apply
 
-# %%
-# Unit Test
-# -----------
-#
-# We can test our custom matrix multiplication operation against cuBLAS (i.e., :code:`torch.matmul`).
-# Note that we need to modify the :code`atol` and :code:`rtol` parameters of `torch.allclose` to account for the fact that we are comparing FP16 tensors.
+M, N, K = 8192, 8192, 8192
 
-a = torch.rand((1024, 1024), device='cuda', dtype=torch.float16)
-b = torch.rand((1024, 1024), device='cuda', dtype=torch.float16)
-c_0 = dot(a, b)
-c_1 = torch.matmul(a, b)
-print(c_0)
-print(c_1)
-print(torch.allclose(c_0, c_1, rtol=1e-3, atol=1e-3))
+torch.manual_seed(0)
 
+a = torch.randn((M, K), device="cuda", dtype=torch.float16)
+b = torch.randn((K, N), device="cuda", dtype=torch.float16)
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=['M', 'N', 'K'],  # argument names to use as an x-axis for the plot
-        x_vals=[8192],  # different possible values for `x_name`
-        y_name='provider',  # argument name whose value corresponds to a different line in the plot
-        y_vals=['torch', 'triton'],  # possible keys for `y_name`
-        y_lines=["Torch", "Triton"],  # label name for the lines
-        ylabel="TFLOPS",  # label name for the y-axis
-        plot_name="matmul-performance",  # name for the plot. Used also as a file name for saving the plot.
-        args={}
-    )
-)
-def benchmark(M, N, K, provider):
-    a = torch.randn((M, K), device='cuda', dtype=torch.float16)
-    b = torch.randn((K, N), device='cuda', dtype=torch.float16)
-    if provider == 'torch':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b))
-    if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: dot(a, b))
-    if provider == 'cutlass':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: triton.testing.cutlass_matmul(a, b))
-    perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
-    print(provider, perf(ms), ms)
-    return perf(ms), perf(max_ms), perf(min_ms)
+th_c = torch.matmul(a, b)
+tt_c = matmul(a, b)
 
-
-benchmark.run(show_plots=True)
+print('********* matmul **********')
+print(f'The maximum difference between torch and triton is ' f'{torch.max(torch.abs(th_c - tt_c))}')
+# assert triton.testing.allclose(th_c, tt_c)
+print(triton.testing.do_bench(lambda: torch.matmul(a, b)))
+print(triton.testing.do_bench(lambda: matmul(a, b)))
+print(triton.testing.do_bench(lambda: triton.ops.matmul(a, b)))
+# print(1)
