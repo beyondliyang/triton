@@ -20,8 +20,14 @@ src = """
 __global__ void dot(TYPE* A, TYPE* B, TYPE* C, 
                    int M, int N, int K, 
                    int lda, int ldb, int ldc) {
-  int pid_m = get_program_id(0);
-  int pid_n = get_program_id(1);
+  int pid = get_program_id(0);
+  int grid_m = (M + MB - 1) / MB;
+  int grid_n = (N + NB - 1) / NB;
+  int width = MAX_GROUP_SIZE * grid_n;
+  int group_id = pid / width;
+  int group_size = min(grid_m - group_id * MAX_GROUP_SIZE, MAX_GROUP_SIZE);
+  int pid_m = group_id * MAX_GROUP_SIZE + (pid % group_size);
+  int pid_n = (pid % width) / (group_size);
   int rm[MB] = pid_m * MB + 0 ... MB;
   int rn[NB] = pid_n * NB + 0 ... NB;
   int rk[KB] = 0 ... KB;
@@ -30,13 +36,13 @@ __global__ void dot(TYPE* A, TYPE* B, TYPE* C,
   float acc[MB, NB] = 0;
   for (int k = K; k > 0; k -= KB) {
     acc += (*pa) @ (*pb);
-    //pa += KB * 1;
-    //pb += KB * ldb;
+    pa += KB * 1;
+    pb += KB * ldb;
   }
   rm = pid_m * MB + 0 ... MB;
   rn = pid_n * NB + 0 ... NB;
   TYPE *pc[MB, NB] = C + (rm[:, newaxis] * ldc + rn[newaxis, :]);
-  *pc = acc;
+  *? (rm[:, newaxis] < M && rn [newaxis, :] < N) pc = acc;
 }
 """
 
@@ -47,12 +53,7 @@ def make_kernel(device, dtype):
     if key not in cache:
         defines = {'TYPE': dtype}
         cache[key] = triton.kernel(
-            src,
-            device=device,
-            defines=defines,
-            autotune_configs=autotune_configs,
-            autotune_key=autotune_key,
-            direct_sass=True,
+            src, device=device, defines=defines, autotune_configs=autotune_configs, autotune_key=autotune_key, direct_sass=True
         )
     return cache[key]
 
@@ -69,18 +70,23 @@ class _dot(torch.autograd.Function):
         assert a.is_contiguous() and b.is_contiguous(), "inputs must be contiguous"
         c = torch.empty((M, N), device=a.device, dtype=a.dtype)
         kernel = make_kernel(a.device, a.dtype)
-        grid = lambda opt: (
-            triton.cdiv(M, opt.MB),
-            triton.cdiv(N, opt.NB),
-        )
+        grid = lambda opt: (triton.cdiv(M, opt.MB) * triton.cdiv(N, opt.NB), )
         kernel(a.data_ptr(), b.data_ptr(), c.data_ptr(), \
                M, N, Ka, \
                a.stride(0), b.stride(0), c.stride(0), \
+
                grid=grid)
         return c
 
 
 dot = _dot.apply
+
+# %%
+# Unit Test
+# -----------
+#
+# We can test our custom matrix multiplication operation against cuBLAS (i.e., :code:`torch.matmul`).
+# Note that we need to modify the :code`atol` and :code:`rtol` parameters of `torch.allclose` to account for the fact that we are comparing FP16 tensors.
 
 a = torch.rand((1024, 1024), device='cuda', dtype=torch.float16)
 b = torch.rand((1024, 1024), device='cuda', dtype=torch.float16)
