@@ -120,3 +120,4 @@ class kernel:
         # run kernel
         grid = grid(kernel.opt)
         kernel(params, self.stream, grid)
+        return kernel

@@ -74,6 +74,15 @@ struct distributed_axis {
   Value* thread_id;
 };
 
+class adder{
+public:
+  adder(Builder** builder): builder_(builder) { }
+  Value* operator()(Value* x, Value* y, const std::string& name = "");
+
+private:
+  Builder** builder_;
+};
+
 class generator: public ir::visitor, public analysis::layout_visitor {
 private:
   void init_idx(ir::value *x);
@@ -190,6 +199,9 @@ private:
   std::map<ir::value*, std::map<indices_t, Value*>> vals_;
   std::map<ir::value*, BasicBlock *> bbs_;
   std::map<ir::value*, std::vector<int>> ords_;
+
+  // helper for creating llvm values
+  adder add;
 
 };
 

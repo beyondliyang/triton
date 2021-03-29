@@ -23,6 +23,18 @@ namespace codegen{
 
 using namespace llvm;
 
+
+
+Value* adder::operator()(Value *x, Value *y, const std::string& name) {
+  // (x + (y + cst)) -> (x + y) + cst
+  if(auto* bin = dyn_cast<BinaryOperator>(y)){
+  if(bin->getOpcode() == llvm::BinaryOperator::Add){
+    std::cout << "can reassociate" << std::endl;
+  }
+  }
+  return (*builder_)->CreateAdd(x, y, name);
+}
+
 // types
 #define void_ty              builder_->getVoidTy()
 #define f16_ty               builder_->getHalfTy()
@@ -33,7 +45,6 @@ using namespace llvm;
 // constants
 #define i32(...)             builder_->getInt32(__VA_ARGS__)
 // ops
-#define add(...)             builder_->CreateAdd(__VA_ARGS__)
 #define and_(...)            builder_->CreateAnd(__VA_ARGS__)
 #define atomic_cmp_xchg(...) builder_->CreateAtomicCmpXchg(__VA_ARGS__)
 #define atomic_rmw(...)      builder_->CreateAtomicRMW(__VA_ARGS__)
@@ -139,7 +150,7 @@ generator::generator(analysis::axes *a_axes,
                     target *tgt,
                     unsigned num_warps)
   : a_axes_(a_axes), layouts_(layouts), alignment_(alignment), alloc_(alloc), swizzle_(swizzle),
-    tgt_(tgt), num_warps_(num_warps) {
+    tgt_(tgt), num_warps_(num_warps), add(&builder_){
 
 }
 
