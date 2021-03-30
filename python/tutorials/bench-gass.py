@@ -156,7 +156,7 @@ class _matmul(torch.autograd.Function):
         ]
         obj = kernel(*args, grid=grid)
         #print(obj.asm('llir'))
-        print(obj.asm('ptx'))
+        #print(obj.asm('ptx'))
         return c
 
     @staticmethod
@@ -180,8 +180,8 @@ tt_c = matmul(a, b)
 print('********* matmul **********')
 print(f'The maximum difference between torch and triton is ' f'{torch.max(torch.abs(th_c - tt_c))}')
 # assert triton.testing.allclose(th_c, tt_c)
-print(triton.testing.do_bench(lambda: torch.matmul(a, b)))
-print(triton.testing.do_bench(lambda: matmul(a, b)))
+#print(triton.testing.do_bench(lambda: torch.matmul(a, b)))
+#print(triton.testing.do_bench(lambda: matmul(a, b)))
 #exit()
-print(triton.testing.do_bench(lambda: triton.ops.matmul(a, b)))
+#print(triton.testing.do_bench(lambda: triton.ops.matmul(a, b)))
 # print(1)
