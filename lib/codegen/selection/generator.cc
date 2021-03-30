@@ -27,12 +27,41 @@ using namespace llvm;
 
 Value* adder::operator()(Value *x, Value *y, const std::string& name) {
   // (x + (y + cst)) -> (x + y) + cst
-  if(auto* bin = dyn_cast<BinaryOperator>(y)){
-  if(bin->getOpcode() == llvm::BinaryOperator::Add){
-    std::cout << "can reassociate" << std::endl;
+  if(auto* bin = dyn_cast<BinaryOperator>(y))
+  if(bin->getOpcode() == llvm::BinaryOperator::BinaryOps::Add)
+  if(dyn_cast<Constant>(bin->getOperand(1))){
+    return (*builder_)->CreateAdd((*builder_)->CreateAdd(x, bin->getOperand(0)),
+                                  bin->getOperand(1));
   }
-  }
+  // default
   return (*builder_)->CreateAdd(x, y, name);
+}
+
+Value* multiplier::operator()(Value *x, Value *y, const std::string &name) {
+  // (x + cst1) * cst2 -> (x * cst2) + (cst1 * cst2)
+  if(auto* bin = dyn_cast<BinaryOperator>(x))
+  if(bin->getOpcode() == llvm::BinaryOperator::BinaryOps::Add)
+  if(dyn_cast<Constant>(bin->getOperand(1)))
+  if(dyn_cast<Constant>(y))
+    return (*builder_)->CreateAdd((*builder_)->CreateMul(bin->getOperand(0), y),
+                                  (*builder_)->CreateMul(bin->getOperand(1), y));
+  // default
+  return (*builder_)->CreateMul(x, y, name);
+}
+
+Value* geper::operator()(Value *ptr, Value* off, const std::string& name){
+  // ptr + (off + cst) -> (ptr + off) + cst
+  if(auto* bin = dyn_cast<BinaryOperator>(off))
+  if(bin->getOpcode() == llvm::BinaryOperator::BinaryOps::Add)
+  if(dyn_cast<Constant>(bin->getOperand(1)))
+    return (*builder_)->CreateGEP((*builder_)->CreateGEP(ptr, bin->getOperand(0)),
+                                  bin->getOperand(1));
+  // default
+ return (*builder_)->CreateGEP(ptr, off, name);
+}
+
+Value* geper::operator()(Type *ty, Value *ptr, std::vector<Value *> vals, const std::string &name) {
+  return (*builder_)->CreateGEP(ty, ptr, vals, name);
 }
 
 // types
@@ -62,7 +91,7 @@ Value* adder::operator()(Value *x, Value *y, const std::string& name) {
 #define fmul(...)            builder_->CreateFMul(__VA_ARGS__)
 #define fpcast(...)          builder_->CreateFPCast(__VA_ARGS__)
 #define fsub(...)            builder_->CreateFSub(__VA_ARGS__)
-#define gep(...)             builder_->CreateGEP(__VA_ARGS__)
+//#define gep(...)             builder_->CreateGEP(__VA_ARGS__)
 #define icmp(...)            builder_->CreateICmp(__VA_ARGS__)
 #define icmp_eq(...)         builder_->CreateICmpEQ(__VA_ARGS__)
 #define icmp_sge(...)        builder_->CreateICmpSGE(__VA_ARGS__)
@@ -73,7 +102,6 @@ Value* adder::operator()(Value *x, Value *y, const std::string& name) {
 #define load(...)            builder_->CreateLoad(__VA_ARGS__)
 #define max_num(...)         builder_->CreateMaxNum(__VA_ARGS__)
 #define min_num(...)         builder_->CreateMinNum(__VA_ARGS__)
-#define mul(...)             builder_->CreateMul(__VA_ARGS__)
 #define neg(...)             builder_->CreateNeg(__VA_ARGS__)
 #define phi(...)             builder_->CreatePHI(__VA_ARGS__)
 #define ret(...)             builder_->CreateRet(__VA_ARGS__)
@@ -150,7 +178,7 @@ generator::generator(analysis::axes *a_axes,
                     target *tgt,
                     unsigned num_warps)
   : a_axes_(a_axes), layouts_(layouts), alignment_(alignment), alloc_(alloc), swizzle_(swizzle),
-    tgt_(tgt), num_warps_(num_warps), add(&builder_){
+    tgt_(tgt), num_warps_(num_warps), add(&builder_), mul(&builder_), gep(&builder_){
 
 }
 
@@ -213,9 +241,9 @@ void generator::visit_phi_node(ir::phi_node* x) {
  * \brief Code Generation for `binary_operator`
  */
 void generator::visit_binary_operator(ir::binary_operator*x) {
+  using ll = llvm::Instruction::BinaryOps;
+  using tt = ir::binary_op_t;
   auto cvt = [](ir::binary_op_t op){
-    using ll = llvm::Instruction::BinaryOps;
-    using tt = ir::binary_op_t;
     switch(op) {
       case tt::Add: return ll::Add;
       case tt::FAdd: return ll::FAdd;
@@ -241,7 +269,13 @@ void generator::visit_binary_operator(ir::binary_operator*x) {
   for(indices_t idx: idxs_.at(x)){
     Value *lhs = vals_[x->get_operand(0)][idx];
     Value *rhs = vals_[x->get_operand(1)][idx];
-    vals_[x][idx] = bin_op(cvt(x->get_op()), lhs, rhs);
+    auto op = cvt(x->get_op());
+    if(op == ll::Add)
+      vals_[x][idx] = add(lhs, rhs);
+    else if(op == ll::Mul)
+      vals_[x][idx] = mul(lhs, rhs);
+    else
+      vals_[x][idx] = bin_op(op, lhs, rhs);
   }
 }
 
@@ -254,8 +288,8 @@ void generator::visit_getelementptr_inst(ir::getelementptr_inst* x) {
     std::vector<Value*> vals;
     for(auto it= x->idx_begin(); it != x->idx_end(); it++)
       vals.push_back(vals_[*it][idx]);
-    Type *ty = cvt(x->get_source_elt_ty()->get_scalar_ty());
-    vals_[x][idx] = gep(ty, ptr, vals);
+    assert(vals.size() == 1);
+    vals_[x][idx] = gep(ptr, vals[0]);
   }
 }
 

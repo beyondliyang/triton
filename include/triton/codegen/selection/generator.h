@@ -83,6 +83,24 @@ private:
   Builder** builder_;
 };
 
+class multiplier{
+public:
+  multiplier(Builder** builder): builder_(builder) { }
+  Value* operator()(Value* x, Value* y, const std::string& name = "");
+private:
+  Builder** builder_;
+};
+
+class geper{
+public:
+  geper(Builder** builder): builder_(builder) { }
+  Value* operator()(Value *ptr, Value* off, const std::string& name = "");
+  Value* operator()(Type* ty, Value*ptr, std::vector<Value*> vals, const std::string& name = "");
+
+private:
+  Builder** builder_;
+};
+
 class generator: public ir::visitor, public analysis::layout_visitor {
 private:
   void init_idx(ir::value *x);
@@ -202,6 +220,8 @@ private:
 
   // helper for creating llvm values
   adder add;
+  multiplier mul;
+  geper gep;
 
 };
 

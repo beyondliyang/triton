@@ -59,7 +59,7 @@ __global__ void matmul(TYPE *A __noalias __readonly,
   // epilogue
   int rcm[TM] = pidm * TM + 0 ... TM;
   int rcn[TN] = pidn * TN + 0 ... TN;
-  int offc[TM, TN] = rcm[:, newaxis] * 8192 + rcn [newaxis, :];
+  int offc[TM, TN] = rcm[:, newaxis] * STRIDE_CM + rcn [newaxis, :] * STRIDE_CN;
   TYPE *pc[TM, TN] = C + offc;
   bool checkc[TM, TN] = rcm[:, newaxis] < M && rcn [newaxis, :] < N;
   // *? (checkc)pc = c;
@@ -81,7 +81,7 @@ class _matmul(torch.autograd.Function):
 
     _DEFAULT_CONFIGS = [
         # ({"TM": "64", "TN": "64", "TK": "32"}, 4),
-        triton.config(defines={"TM": "128", "TN": "128", "TK": "16"}, num_warps=4),
+        triton.config(defines={"TM": "128", "TN": "128", "TK": "32"}, num_warps=4),
         # ({"TM": "128", "TN": "128", "TK": "32"}, 4),
         # ({'TM': '64', 'TN': '128', 'TK': '32'}, 4),
         # ({'TM': '128', 'TN': '64', 'TK': '32'}, 4),
@@ -132,6 +132,8 @@ class _matmul(torch.autograd.Function):
                 "STRIDE_AK": "1" if is_a_row else f"{lda}",
                 "STRIDE_BK": f"{ldb}" if is_b_row else "1",
                 "STRIDE_BN": "1" if is_b_row else f"{ldb}",
+                "STRIDE_CM": f"{ldc}",
+                "STRIDE_CN": "1",
                 "LDA_POW2_DIV": lda_pow2_div,
                 "LDB_POW2_DIV": ldb_pow2_div,
                 "LDC_POW2_DIV": ldc_pow2_div,
@@ -153,8 +155,8 @@ class _matmul(torch.autograd.Function):
             1,
         ]
         obj = kernel(*args, grid=grid)
+        #print(obj.asm('llir'))
         print(obj.asm('ptx'))
-        print(obj.asm('llir'))
         return c
 
     @staticmethod
@@ -178,8 +180,8 @@ tt_c = matmul(a, b)
 print('********* matmul **********')
 print(f'The maximum difference between torch and triton is ' f'{torch.max(torch.abs(th_c - tt_c))}')
 # assert triton.testing.allclose(th_c, tt_c)
-#print(triton.testing.do_bench(lambda: torch.matmul(a, b)))
-#print(triton.testing.do_bench(lambda: matmul(a, b)))
-exit()
-#print(triton.testing.do_bench(lambda: triton.ops.matmul(a, b)))
+print(triton.testing.do_bench(lambda: torch.matmul(a, b)))
+print(triton.testing.do_bench(lambda: matmul(a, b)))
+#exit()
+print(triton.testing.do_bench(lambda: triton.ops.matmul(a, b)))
 # print(1)
