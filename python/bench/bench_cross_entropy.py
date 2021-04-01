@@ -4,7 +4,7 @@ import triton
 confs = [
     triton.testing.Benchmark(
               x_names = ['N'],
-              x_vals  = [128, 256, 512, 1024, 2048, 3072, 4096, 6144, 8192],
+              x_vals  = [256 * i for i in range(1, 65)],
               y_name  = 'provider',
               y_vals  = ['triton', 'torch'],
               y_lines = ['Triton', 'Torch'],
@@ -37,4 +37,4 @@ def bench_op(M, N, dtype, mode, provider):
 
 
 if __name__ == '__main__':
-    bench_op.run('tmp', False)
+    bench_op.run(print_data=True)
